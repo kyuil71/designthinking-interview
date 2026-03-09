@@ -63,7 +63,7 @@
         Context: ${persona.description}. Needs: ${persona.needs}.
         Answer ALL the following questions realistically as this persona:
         ${questions.map((q, i) => `${i+1}. ${q}`).join("\n")}
-        [RULE] Do NOT use markdown bold (**). Use natural, conversational Korean. 
+        [RULE] 각 질문에 대한 답변은 5문장 정도로 매우 상세하게 작성해 주세요. 답변에는 페르소나의 성격이 드러나는 구체적인 일상 에피소드나 과거의 직접적인 경험담을 반드시 포함하여 답변의 현장감과 설득력을 높여주세요. Do NOT use markdown bold (**). Use natural, conversational Korean. 
         [FORMAT] For "keyInsights", use 1) 2) 3) format.
         Return JSON: { "summary": "Full session summary", "qaPairs": [{ "q": "Question Text", "a": "Answer Text" }], "keyInsights": "1) ... \\n 2) ..." }.`,
 
@@ -343,7 +343,7 @@
                   <div class="mb-8">
                     <a href="https://aistudio.google.com/app/apikey" target="_blank" class="text-[#2563EB] font-bold text-[18px] underline underline-offset-4">개인 API Key 발급받기</a>
                   </div>
-                  <input type="password" id="api-input" class="w-full h-[62px] bg-white border border-[#CBD5E1] rounded-[1.2rem] text-center focus:ring-2 focus:ring-blue-500 outline-none text-[18px] font-medium mb-5" placeholder="">
+                  <input type="password" id="api-input" class="w-full h-[62px] bg-white border-2 border-[#CBD5E1] rounded-[1.2rem] text-center focus:ring-2 focus:ring-blue-500 outline-none text-[18px] font-medium mb-5 placeholder:text-slate-400" placeholder="API 입력">
                   <p class="text-[#64748B] font-medium text-[12px] leading-relaxed mb-10 px-4">분석을 위해 유효한 Gemini API 키를 직접 입력해 주세요.<br/>(로컬 브라우저에만 임시 유지됩니다)</p>
                   <button onclick="Actions.validateKey()" class="w-full py-5 bg-[#1e3a8a] text-white rounded-[1.2rem] font-bold text-[20px] shadow-sm btn-active">API Key 입력 후 시작</button>
                 </div>
@@ -398,7 +398,7 @@
                 <div class="space-y-6 mb-4 transition-all">
                   <div class="p-5 bg-blue-50/50 border border-blue-100 rounded-3xl space-y-4">
                     <div class="flex items-center justify-between gap-2">
-                      <h4 class="text-sm font-black text-blue-500 uppercase tracking-widest flex items-center gap-2">
+                      <h4 class="text-sm font-black text-blue-600 uppercase tracking-widest flex items-center gap-2">
                         <i data-lucide="sparkles" class="w-4 h-4"></i> 타겟 수정 지시
                       </h4>
                       <button onclick="Actions.generatePersonas(document.getElementById('persona-inst').value)" class="shrink-0 w-11 h-11 bg-blue-600 text-white rounded-xl shadow-lg flex items-center justify-center btn-active">
