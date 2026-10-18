@@ -2,8 +2,18 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Research Lab.</title>
+  <!-- 홈 화면에 추가해 실행하면 주소창 없이 전체 화면으로 열림 -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <!-- default: 아이폰 홈 화면 실행 시 상단 메뉴가 시계·배터리 표시줄과 겹치지 않도록 -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Research Lab" />
 
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
@@ -30,6 +40,10 @@
     .hero-title { font-size: 13.5vw; line-height: 1.1; }
     @media (min-width: 430px) { .hero-title { font-size: 58px; } }
     .btn-active:active { transform: scale(0.98); transition: all 0.1s; }
+    /* 하단 고정 버튼 영역 — 아이폰 홈 바(safe-area)만큼 여백 확보 */
+    .dock { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
+    .dock-space { padding-bottom: calc(128px + env(safe-area-inset-bottom)); }
+    .dock-space-2 { padding-bottom: calc(196px + env(safe-area-inset-bottom)); }
   </style>
 </head>
 <body>
@@ -40,7 +54,10 @@
       // --- CONFIG & CONSTANTS ---
       const MODEL_NAME = "gemini-flash-latest";
       const SESSION_KEY_API = "research_lab_api_key_v31";
-      const LOCAL_STORAGE_KEY = "research_lab_saved_state_v31";
+      const LEGACY_STORAGE_KEY = "research_lab_saved_state_v31";   // 이전 버전(단일 저장) — 처음 실행 시 목록으로 옮김
+      const PROJECTS_KEY = "research_lab_projects_v32";
+      const MAX_PROJECTS = 5;
+      const AUTOSAVE_MS = 5000;
 
       // --- PROMPT TEMPLATES ---
       const PROMPTS = {
@@ -73,21 +90,72 @@
         Return JSON: { "q": "${question}", "a": "Answer" }.`
       };
 
+      const uid = () => "p_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+      const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+      // --- 저장소 — 트렌드 인사이트 랩과 같은 슬롯 방식(최대 5개) + 용량 처리 ---
+      const Store = {
+        list() {
+          try {
+            const raw = localStorage.getItem(PROJECTS_KEY);
+            const arr = raw ? JSON.parse(raw) : [];
+            return Array.isArray(arr) ? arr : [];
+          } catch (e) { console.warn("저장 목록을 읽지 못했습니다.", e); return []; }
+        },
+        _write(list) {
+          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(list)); return true; }
+          catch (e) { return false; }
+        },
+        save(snapshot, meta) {
+          let list = Store.list().filter(p => p.id !== meta.id);
+          list.unshift({ id: meta.id, title: meta.title, savedAt: Date.now(), data: snapshot });
+          if (list.length > MAX_PROJECTS) list = list.slice(0, MAX_PROJECTS);
+          if (Store._write(list)) return { ok: true };
+          // 용량 초과: 가장 오래된 프로젝트를 버리고 재시도
+          const reduced = list.slice(0, Math.max(1, list.length - 1));
+          if (Store._write(reduced)) return { ok: true, pruned: "oldest" };
+          return { ok: false };
+        },
+        remove(id) { return Store._write(Store.list().filter(p => p.id !== id)); }
+      };
+
+      // 이전 버전에서 저장한 단일 프로젝트를 목록으로 옮김 (한 번만)
+      (function migrateLegacy() {
+        try {
+          const old = localStorage.getItem(LEGACY_STORAGE_KEY);
+          if (!old) return;
+          const data = JSON.parse(old);
+          if (Store.list().length === 0 && data && (data.researchTopic || (data.aiPersonas || []).length)) {
+            const id = uid();
+            Store._write([{ id, title: (data.researchTopic || "이전 프로젝트").slice(0, 40), savedAt: Date.now(), data: { ...data, projectId: id } }]);
+          }
+          localStorage.removeItem(LEGACY_STORAGE_KEY);
+        } catch (e) { /* 무시 */ }
+      })();
+
+      function blankProject() {
+        return {
+          projectId: uid(),
+          maxStepReached: 1,
+          researchTopic: "",
+          aiPersonas: [],
+          manualPersonas: [],
+          selectedPersonaId: null,
+          aiSurveys: [],
+          manualSurveys: [],
+          selectedQuestionIds: [],
+          history: []
+        };
+      }
+
       // --- GLOBAL STATE ---
       let state = {
-        apiKey: sessionStorage.getItem(SESSION_KEY_API) || "", 
-        step: -1, 
-        maxStepReached: -1, 
-        researchTopic: "",
-        aiPersonas: [], 
-        manualPersonas: [], 
-        selectedPersonaId: null,
-        aiSurveys: [], 
-        manualSurveys: [], 
-        selectedQuestionIds: [], 
-        history: [], 
-        isAnalyzing: false, 
-        errorMsg: null
+        apiKey: sessionStorage.getItem(SESSION_KEY_API) || "",
+        step: -1,
+        isAnalyzing: false,
+        errorMsg: null,
+        ...blankProject(),
+        maxStepReached: -1
       };
 
       window.state = state;
@@ -102,6 +170,52 @@
         if (newState.step !== undefined && newState.step !== prevStep) window.scrollTo(0, 0);
       }
       window.setState = setState;
+
+      // --- 자동 저장 ---
+      let lastSaved = "";
+      let quotaWarned = false;
+
+      function snapshotOf(s) {
+        const { apiKey, isAnalyzing, errorMsg, ...data } = s;
+        return data;
+      }
+      function projectTitle() {
+        if (state.researchTopic) return state.researchTopic.slice(0, 40);
+        return "제목 없는 프로젝트";
+      }
+      // 저장해 둔 단계가 데이터와 맞지 않으면 갈 수 있는 마지막 단계로 보정
+      function resumeStep(d) {
+        const has = (a) => Array.isArray(a) && a.length > 0;
+        const hasPersonas = has(d.aiPersonas) || has(d.manualPersonas);
+        const ok = {
+          1: true,
+          2: hasPersonas,
+          3: hasPersonas,
+          4: !!d.selectedPersonaId && (has(d.aiSurveys) || has(d.manualSurveys)),
+          5: !!d.selectedPersonaId && has(d.selectedQuestionIds),
+          6: has(d.history)
+        };
+        let s = parseInt(d.step, 10);
+        if (!(s >= 1 && s <= 6)) s = 6;
+        while (s > 1 && !ok[s]) s--;
+        return s;
+      }
+      function persist(force) {
+        if (state.step < 1) return "skip";
+        // 주제도 결과도 없는 빈 프로젝트는 목록을 차지하지 않도록 저장하지 않음
+        if (!state.researchTopic && !state.aiPersonas.length && !state.manualPersonas.length) return "skip";
+        const snap = snapshotOf(state);
+        const serialized = JSON.stringify(snap);
+        if (!force && serialized === lastSaved) return "skip";
+        const r = Store.save(snap, { id: state.projectId, title: projectTitle() });
+        if (r.ok) {
+          lastSaved = serialized;
+          if (r.pruned === "oldest" && !quotaWarned) { quotaWarned = true; showToast("공간 확보를 위해 가장 오래된 프로젝트를 정리했습니다."); }
+          return "ok";
+        }
+        if (!quotaWarned) { quotaWarned = true; showToast("저장 공간이 부족해 자동 저장이 중단되었습니다."); }
+        return "full";
+      }
 
       // --- API CALL WITH EXPONENTIAL BACKOFF ---
       async function callGemini(systemPrompt, userPrompt) {
@@ -168,29 +282,30 @@
           }
         },
 
-        loadFromLocal() {
-          const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
-          if (saved) {
-            try {
-              const data = JSON.parse(saved);
-              const currentApiKey = state.apiKey;
-              setState({ ...data, apiKey: currentApiKey, isAnalyzing: false });
-              showToast("이전 프로젝트를 성공적으로 불러왔습니다.");
-              return true;
-            } catch (e) { console.error("Local load failed", e); }
-          }
-          showToast("저장된 프로젝트 데이터가 없습니다.");
-          return false;
+        openProject(id) {
+          const p = Store.list().find(x => x.id === id);
+          if (!p) { showToast("해당 프로젝트를 찾을 수 없습니다."); return; }
+          const data = { ...blankProject(), ...p.data, projectId: p.id };
+          const step = resumeStep(data);
+          lastSaved = JSON.stringify(snapshotOf({ ...data, step }));
+          setState({ ...data, step, maxStepReached: Math.max(data.maxStepReached || 1, step), isAnalyzing: false, errorMsg: null });
+          showToast("프로젝트를 열었습니다.");
+        },
+
+        deleteProject(id) {
+          if (!confirm("이 프로젝트를 삭제할까요? 되돌릴 수 없습니다.")) return;
+          showToast(Store.remove(id) ? "프로젝트를 삭제했습니다." : "삭제에 실패했습니다.");
+          render();
+        },
+
+        goHome() {
+          persist(true);
+          setState({ step: 0 });
         },
 
         startNewProject() {
-          const currentApiKey = state.apiKey;
-          const initialState = {
-            step: 1, maxStepReached: -1, researchTopic: "", aiPersonas: [], manualPersonas: [], 
-            selectedPersonaId: null, aiSurveys: [], manualSurveys: [], selectedQuestionIds: [], 
-            history: [], isAnalyzing: false, errorMsg: null
-          };
-          setState({ ...initialState, apiKey: currentApiKey });
+          lastSaved = "";
+          setState({ ...blankProject(), step: 1, isAnalyzing: false, errorMsg: null });
         },
 
         async generatePersonas(instruction = "") {
@@ -289,7 +404,8 @@
       function showToast(message) {
         const toast = document.createElement("div");
         toast.innerText = message;
-        toast.className = "fixed bottom-24 left-1/2 -translate-x-1/2 bg-black/80 text-white px-6 py-3 rounded-full text-sm font-bold z-[10000] animate-fade-in shadow-xl";
+        toast.className = "fixed left-1/2 -translate-x-1/2 bg-black/80 text-white px-6 py-3 rounded-full text-sm font-bold z-[10000] animate-fade-in shadow-xl whitespace-nowrap";
+        toast.style.bottom = "calc(112px + env(safe-area-inset-bottom))";
         document.body.appendChild(toast);
         setTimeout(() => toast.remove(), 2500);
       }
@@ -306,7 +422,7 @@
       function renderHeader(title, prevStep) {
         const canGoNext = state.step < state.maxStepReached;
         return `
-          <header class="fixed top-0 left-0 right-0 z-50 bg-white border-b border-slate-100 px-6 h-16 flex items-center justify-between max-w-[430px] mx-auto">
+          <header class="fixed top-0 left-0 right-0 z-50 bg-white border-b border-slate-100 px-4 h-16 flex items-center justify-between max-w-[430px] mx-auto">
             <div class="flex items-center gap-1">
               <button onclick="setState({step: ${prevStep}})" class="p-2 -ml-2 rounded-full hover:bg-slate-50 transition-all"><i data-lucide="chevron-left" class="w-7 h-7 text-slate-500"></i></button>
               ${canGoNext ? `<button onclick="setState({step: ${state.step + 1}})" class="p-2 rounded-full hover:bg-slate-50 text-slate-500 transition-all"><i data-lucide="chevron-right" class="w-7 h-7"></i></button>` : ""}
@@ -314,7 +430,7 @@
             </div>
             <div class="flex items-center gap-1">
               <button onclick="copyReportToClipboard()" class="p-2 rounded-full hover:bg-slate-100 text-slate-500 transition-all"><i data-lucide="copy" class="w-6 h-6"></i></button>
-              <button onclick="setState({step: 0})" class="p-2 rounded-full hover:bg-slate-100 text-slate-500 transition-all"><i data-lucide="home" class="w-6 h-6"></i></button>
+              <button onclick="Actions.goHome()" aria-label="홈으로 (저장)" class="p-2 rounded-full hover:bg-slate-100 text-slate-500 transition-all"><i data-lucide="home" class="w-6 h-6"></i></button>
             </div>
           </header>`;
       }
@@ -332,105 +448,118 @@
 
         switch (state.step) {
           case -1:
-            content += `<div class="min-h-screen flex flex-col items-center justify-center p-10 bg-white text-center animate-fade-in">
-                <div class="w-24 h-24 bg-blue-600 rounded-full flex items-center justify-center mb-10 shadow-[0_8px_30px_rgb(37,99,235,0.4)] btn-active"><i data-lucide="fingerprint" class="text-white w-12 h-12"></i></div>
+            content += `<div class="min-h-screen flex flex-col items-center justify-center px-8 py-10 bg-white text-center animate-fade-in">
+                <div class="w-24 h-24 bg-blue-600 rounded-full flex items-center justify-center mb-8 shadow-[0_8px_30px_rgb(37,99,235,0.4)] btn-active"><i data-lucide="fingerprint" class="text-white w-12 h-12"></i></div>
                 <div class="w-full px-2 mb-4">
                   <h1 class="hero-title font-black italic tracking-tighter text-slate-900 mb-2">Research Lab.<br/>Be Creative!</h1>
                 </div>
-                <p class="text-slate-400 font-medium mb-16 text-sm">AI 기반 디자인 리서치 자동화 도구</p>
+                <p class="text-slate-400 font-medium mb-10 text-sm">AI 기반 디자인 리서치 자동화 도구</p>
                 
                 <div class="w-full">
-                  <div class="mb-8">
+                  <div class="mb-5">
                     <a href="https://aistudio.google.com/app/apikey" target="_blank" class="text-[#2563EB] font-bold text-[18px] underline underline-offset-4">개인 API Key 발급받기</a>
                   </div>
-                  <input type="password" id="api-input" class="w-full h-[62px] bg-white border-2 border-[#CBD5E1] rounded-[1.2rem] text-center focus:ring-2 focus:ring-blue-500 outline-none text-[18px] font-medium mb-5 placeholder:text-slate-400" placeholder="API 입력">
-                  <p class="text-[#64748B] font-medium text-[12px] leading-relaxed mb-10 px-4">분석을 위해 유효한 Gemini API 키를 직접 입력해 주세요.<br/>(로컬 브라우저에만 임시 유지됩니다)</p>
+                  <input type="password" id="api-input" class="w-full h-[62px] bg-white border-2 border-[#CBD5E1] rounded-[1.2rem] text-center focus:ring-2 focus:ring-blue-500 outline-none text-[18px] font-medium mb-3 placeholder:text-slate-400" placeholder="API 입력" onkeydown="if(event.key==='Enter'){event.preventDefault(); Actions.validateKey();}">
+                  <p class="text-[#64748B] font-medium text-[12px] leading-relaxed mb-6 px-4">분석을 위해 유효한 Gemini API 키를 직접 입력해 주세요.<br/>(로컬 브라우저에만 임시 유지됩니다)</p>
                   <button onclick="Actions.validateKey()" class="w-full py-5 bg-[#1e3a8a] text-white rounded-[1.2rem] font-bold text-[20px] shadow-sm btn-active">API Key 입력 후 시작</button>
                 </div>
               </div>`;
             break;
 
-          case 0:
-            content += `<div class="min-h-screen flex flex-col p-8 bg-dark-navy text-white relative overflow-hidden">
-                <div class="flex-1 flex flex-col justify-center space-y-10 animate-fade-in">
-                  <div class="inline-block px-4 py-1.5 bg-blue-600 rounded-full text-[12px] font-black tracking-widest uppercase w-fit">Design Researcher AI</div>
-                  <h1 class="text-5xl font-black leading-tight tracking-tighter">사용자의<br/>진심을<br/><span class="text-blue-500">발견하세요.</span></h1>
-                  <p class="text-slate-400 text-lg leading-relaxed font-medium">디자인 리서치 전 과정을 AI가 돕습니다.<br/>주제 설정부터 인터뷰까지 단숨에 진행하세요.</p>
-                </div>
-                <div class="space-y-4 pb-10">
-                  <button onclick="Actions.loadFromLocal()" class="w-full py-5 bg-slate-800/50 border border-white/20 text-white rounded-2xl font-bold text-xl flex items-center justify-center gap-2 shadow-2xl btn-active">기존 프로젝트 열기 <i data-lucide="folder-open" class="w-5 h-5"></i></button>
-                  <button onclick="Actions.startNewProject()" class="w-full py-6 bg-white text-slate-900 rounded-2xl font-black text-xl shadow-2xl flex items-center justify-center gap-2 btn-active">
+          case 0: {
+            const projects = Store.list();
+            content += `<div class="min-h-screen flex flex-col px-7 pt-14 pb-10 bg-dark-navy text-white relative overflow-hidden">
+                <div class="flex-1 flex flex-col justify-center gap-8 animate-fade-in">
+                  <div class="space-y-5">
+                    <div class="inline-block px-4 py-1.5 bg-blue-600 rounded-full text-[12px] font-black tracking-widest uppercase w-fit">Design Researcher AI</div>
+                    <h1 class="text-5xl font-black leading-tight tracking-tighter">사용자의<br/>진심을<br/><span class="text-blue-500">발견하세요.</span></h1>
+                    <p class="text-slate-400 text-lg leading-relaxed font-medium">디자인 리서치 전 과정을 AI가 돕습니다.<br/>주제 설정부터 인터뷰까지 단숨에 진행하세요.</p>
+                  </div>
+                  <button onclick="Actions.startNewProject()" class="w-full py-5 bg-white text-slate-900 rounded-2xl font-black text-xl shadow-2xl flex items-center justify-center gap-2 btn-active">
                     새 프로젝트 시작 <i data-lucide="arrow-right" class="w-6 h-6"></i>
                   </button>
+                  <div>
+                    <h2 class="text-[13px] font-black tracking-widest text-slate-400 mb-3">저장된 프로젝트 ${projects.length}/${MAX_PROJECTS}</h2>
+                    ${projects.length ? `<ul class="space-y-2">${projects.map(p => `
+                      <li class="flex items-center gap-2 bg-white/5 border border-white/10 rounded-2xl pl-4 pr-1.5 py-2.5">
+                        <button type="button" onclick="Actions.openProject('${esc(p.id)}')" class="flex-1 text-left min-w-0">
+                          <span class="block text-base font-bold text-white truncate">${esc(p.title)}</span>
+                          <span class="block text-[13px] text-slate-400">${esc(new Date(p.savedAt).toLocaleString("ko-KR"))}</span>
+                        </button>
+                        <button type="button" aria-label="${esc(p.title)} 삭제" onclick="Actions.deleteProject('${esc(p.id)}')" class="p-2.5 rounded-full hover:bg-white/10 text-slate-400 shrink-0"><i data-lucide="trash-2" class="w-5 h-5"></i></button>
+                      </li>`).join("")}</ul>`
+                    : `<p class="text-sm text-slate-400 bg-white/5 border border-white/10 rounded-2xl px-4 py-4 leading-relaxed">아직 저장된 프로젝트가 없습니다. 새 프로젝트를 시작하면 진행 상태가 자동으로 저장됩니다.</p>`}
+                  </div>
                 </div>
               </div>`;
             break;
+          }
 
           case 1:
-            content += `<div class="pt-24 px-6 min-h-screen flex flex-col animate-fade-in bg-white">
+            content += `<div class="pt-24 px-5 dock-space min-h-screen flex flex-col animate-fade-in bg-white">
                 ${renderHeader("주제 설정", 0)}
-                <div class="mb-10">
-                  <h2 class="text-3xl font-black mb-3 tracking-tight leading-tight text-slate-900">어떤 주제로<br/>사용자 리서치를 진행할까요?</h2>
+                <div class="mb-6">
+                  <h2 class="text-3xl font-black mb-2 tracking-tight leading-tight text-slate-900">어떤 주제로<br/>사용자 리서치를 진행할까요?</h2>
                   <p class="text-slate-400 font-medium text-sm">탐색하고 싶은 과제를 구체적으로 입력해 주세요.</p>
                 </div>
-                <textarea id="topic-input" class="w-full h-64 p-6 bg-slate-50 border border-slate-100 rounded-[2.5rem] text-xl outline-none placeholder:text-slate-300 font-medium leading-relaxed" placeholder="예: 해외 여행을 계획할 때 스트레스를 느끼는 1인 가구">${state.researchTopic}</textarea>
-                <div class="fixed bottom-0 left-0 right-0 p-6 bg-white/95 border-t max-w-[430px] mx-auto z-[60]">
-                  <button onclick="const val = document.getElementById('topic-input').value; if(val){ setState({researchTopic: val}); Actions.generatePersonas(); }" class="w-full py-6 bg-slate-900 text-white rounded-2xl font-black text-lg shadow-2xl btn-active">인터뷰 타겟 제안 받기</button>
+                <textarea id="topic-input" class="w-full h-60 p-5 bg-slate-50 border border-slate-100 rounded-[2rem] text-xl outline-none placeholder:text-slate-300 font-medium leading-relaxed" placeholder="예: 해외 여행을 계획할 때 스트레스를 느끼는 1인 가구">${state.researchTopic}</textarea>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="const val = document.getElementById('topic-input').value; if(val){ setState({researchTopic: val}); Actions.generatePersonas(); }" class="w-full py-5 bg-slate-900 text-white rounded-2xl font-black text-lg shadow-lg btn-active">인터뷰 타겟 제안 받기</button>
                 </div>
               </div>`;
             break;
 
           case 2:
-            content += `<div class="pt-24 px-6 pb-64 animate-fade-in bg-white">
+            content += `<div class="pt-24 px-5 dock-space animate-fade-in bg-white">
                 ${renderHeader("타겟 제안", 1)}
                 <h2 class="text-3xl font-black mb-2 tracking-tight text-slate-900">이런 분들은 어떠신가요?</h2>
-                <p class="text-blue-600 text-lg font-bold mb-10">리서치 전문가가 분석한 최적의 타겟 10명입니다.</p>
-                <div class="space-y-0 mb-10">
+                <p class="text-blue-600 text-lg font-bold mb-4">리서치 전문가가 분석한 최적의 타겟 10명입니다.</p>
+                <div class="space-y-0 mb-6">
                   ${[...state.aiPersonas, ...state.manualPersonas].map((p, i) => `
-                    <div class="py-10 border-b border-slate-100 animate-fade-in last:border-0">
-                      <h3 class="font-black text-[22px] text-slate-900 mb-6 leading-snug">${i+1}. ${p.name}</h3>
-                      <p class="text-[17px] text-slate-700 font-medium mb-8 leading-relaxed whitespace-pre-line">${p.description}</p>
-                      <div class="w-full bg-quote-gray px-5 py-5 rounded-2xl text-[18px] text-slate-600 font-medium italic border border-slate-200/40">
+                    <div class="py-7 border-b border-slate-100 animate-fade-in last:border-0">
+                      <h3 class="font-black text-[22px] text-slate-900 mb-3 leading-snug">${i+1}. ${p.name}</h3>
+                      <p class="text-[17px] text-slate-700 font-medium mb-4 leading-relaxed whitespace-pre-line">${p.description}</p>
+                      <div class="w-full bg-quote-gray px-5 py-4 rounded-2xl text-[17px] text-slate-600 font-medium italic border border-slate-200/40">
                         <span class="font-black text-slate-900 not-italic">- 주요니즈:</span> " ${p.needs} "
                       </div>
                     </div>`).join('')}
                 </div>
-                <div class="space-y-6 mb-4 transition-all">
-                  <div class="p-5 bg-blue-50/50 border border-blue-100 rounded-3xl space-y-4">
-                    <div class="flex items-center justify-between gap-2">
-                      <h4 class="text-sm font-black text-blue-600 uppercase tracking-widest flex items-center gap-2">
-                        <i data-lucide="sparkles" class="w-4 h-4"></i> 타겟 수정 지시
-                      </h4>
-                      <button onclick="Actions.generatePersonas(document.getElementById('persona-inst').value)" class="shrink-0 w-11 h-11 bg-blue-600 text-white rounded-xl shadow-lg flex items-center justify-center btn-active">
+                <div class="space-y-3">
+                  <div class="p-4 bg-blue-50/50 border border-blue-100 rounded-3xl space-y-2.5">
+                    <h4 class="text-sm font-black text-blue-600 uppercase tracking-widest flex items-center gap-2">
+                      <i data-lucide="sparkles" class="w-4 h-4"></i> 타겟 수정 지시
+                    </h4>
+                    <div class="flex items-center gap-2">
+                      <input type="text" id="persona-inst" onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.generatePersonas(document.getElementById('persona-inst').value);}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 소득 수준 낮은 학생 위주">
+                      <button onclick="Actions.generatePersonas(document.getElementById('persona-inst').value)" aria-label="보내기" class="shrink-0 w-12 h-12 bg-blue-600 text-white rounded-2xl shadow-md flex items-center justify-center btn-active">
                         <i data-lucide="send" class="w-5 h-5"></i>
                       </button>
                     </div>
-                    <input type="text" id="persona-inst" class="w-full p-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 소득 수준 낮은 학생 위주">
                   </div>
-                  <div class="p-5 bg-slate-50 border border-slate-200/50 rounded-3xl space-y-4">
+                  <div class="p-4 bg-slate-50 border border-slate-200/50 rounded-3xl space-y-2.5">
                     <h4 class="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><i data-lucide="plus" class="w-4 h-4"></i> 직접 타겟 추가</h4>
-                    <input type="text" id="manual-p-name" class="w-full p-4 bg-white border border-slate-200 rounded-2xl text-base font-bold outline-none" placeholder="이름 또는 제목">
-                    <textarea id="manual-p-desc" class="w-full p-4 bg-white border border-slate-200 rounded-2xl text-base h-32 outline-none resize-none" placeholder="배경 및 니즈 정보"></textarea>
-                    <button onclick="Actions.addManualPersona()" class="w-full py-4 bg-dark-navy text-white rounded-2xl font-black text-xl btn-active">리스트에 추가</button>
+                    <input type="text" id="manual-p-name" class="w-full h-12 px-4 bg-white border border-slate-200 rounded-2xl text-base font-bold outline-none" placeholder="이름 또는 제목">
+                    <textarea id="manual-p-desc" class="w-full p-4 bg-white border border-slate-200 rounded-2xl text-base h-28 outline-none resize-none" placeholder="배경 및 니즈 정보"></textarea>
+                    <button onclick="Actions.addManualPersona()" class="w-full py-3.5 bg-dark-navy text-white rounded-2xl font-black text-lg btn-active">리스트에 추가</button>
                   </div>
                 </div>
-                <div class="fixed bottom-0 left-0 right-0 p-6 bg-white/95 border-t max-w-[430px] mx-auto z-[60]">
-                  <button onclick="setState({step: 3})" class="w-full py-6 bg-blue-600 text-white rounded-2xl font-black text-xl shadow-2xl btn-active">인터뷰 대상 선택</button>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="setState({step: 3})" class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg shadow-lg btn-active">인터뷰 대상 선택</button>
                 </div>
               </div>`;
             break;
 
           case 3:
             const selectable = [...state.aiPersonas, ...state.manualPersonas];
-            content += `<div class="pt-24 px-6 pb-40 animate-fade-in bg-white">
+            content += `<div class="pt-24 px-5 dock-space animate-fade-in bg-white">
                 ${renderHeader("타겟 선택", 2)}
-                <h2 class="text-3xl font-black mb-8 tracking-tight text-slate-900">인터뷰를 진행할<br/>핵심 타겟을 골라주세요</h2>
-                <div class="grid gap-5">
+                <h2 class="text-3xl font-black mb-5 tracking-tight text-slate-900">인터뷰를 진행할<br/>핵심 타겟을 골라주세요</h2>
+                <div class="grid gap-3">
                   ${selectable.map((p, i) => {
                     const isDone = state.history.some(h => h.personaId === p.id);
                     const isSel = state.selectedPersonaId === p.id;
-                    return `<div onclick="${isDone ? '' : `setState({selectedPersonaId: '${p.id}', aiSurveys: [], manualSurveys: [], selectedQuestionIds: []})`}" class="p-6 rounded-[2.5rem] border-2 transition-all cursor-pointer ${isDone ? 'opacity-40 bg-slate-50 border-slate-100' : (isSel ? 'border-blue-600 bg-blue-50 shadow-lg scale-[1.03]' : 'border-slate-100 bg-white hover:border-slate-200 shadow-sm')}">
-                      <div class="flex items-center gap-4 mb-3">
+                    return `<div onclick="${isDone ? '' : `setState({selectedPersonaId: '${p.id}', aiSurveys: [], manualSurveys: [], selectedQuestionIds: []})`}" class="p-5 rounded-[2rem] border-2 transition-all cursor-pointer ${isDone ? 'opacity-40 bg-slate-50 border-slate-100' : (isSel ? 'border-blue-600 bg-blue-50 shadow-lg' : 'border-slate-100 bg-white hover:border-slate-200 shadow-sm')}">
+                      <div class="flex items-center gap-3 mb-2">
                         <div class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${isSel ? 'bg-blue-600 text-white shadow-lg' : 'bg-slate-100 text-slate-400'} font-black text-lg">${i + 1}</div>
                         <h3 class="font-black text-xl text-slate-900">${p.name} ${isDone ? '(완료)' : ''}</h3>
                       </div>
@@ -438,41 +567,41 @@
                     </div>`;
                   }).join('')}
                 </div>
-                <div class="fixed bottom-0 left-0 right-0 p-6 bg-white border-t max-w-[430px] mx-auto z-[60]">
-                  <button onclick="Actions.generateSurveys()" ${!state.selectedPersonaId ? 'disabled' : ''} class="w-full py-6 bg-slate-900 text-white rounded-2xl font-black text-lg btn-active shadow-2xl disabled:opacity-30">인터뷰 질문 제안 받기</button>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="Actions.generateSurveys()" ${!state.selectedPersonaId ? 'disabled' : ''} class="w-full py-5 bg-slate-900 text-white rounded-2xl font-black text-lg btn-active shadow-lg disabled:opacity-30">인터뷰 질문 제안 받기</button>
                 </div>
               </div>`;
             break;
 
           case 4:
             const combinedSurveys = [...state.aiSurveys, ...state.manualSurveys];
-            content += `<div class="pt-24 px-6 pb-64 animate-fade-in bg-white">
+            content += `<div class="pt-24 px-5 dock-space animate-fade-in bg-white">
                 ${renderHeader("질문 설계", 3)}
-                <h2 class="text-3xl font-black mb-4 tracking-tight text-slate-900">인터뷰 질문 설계</h2>
-                <p class="text-blue-600 text-lg font-bold mb-10">질문들을 개별 선택하여 최적의 인터뷰를 구성하세요.</p>
-                <div class="space-y-12 mb-10">
+                <h2 class="text-3xl font-black mb-2 tracking-tight text-slate-900">인터뷰 질문 설계</h2>
+                <p class="text-blue-600 text-lg font-bold mb-6">질문들을 개별 선택하여 최적의 인터뷰를 구성하세요.</p>
+                <div class="space-y-8 mb-6">
                   ${combinedSurveys.map(s => `
                     <div>
-                      <h3 class="font-black text-xl text-slate-900 mb-6 flex items-center gap-3"><div class="w-2.5 h-6 bg-blue-600 rounded-full"></div> ${s.title}</h3>
-                      <div class="space-y-4">
+                      <h3 class="font-black text-xl text-slate-900 mb-3 flex items-center gap-3"><div class="w-2.5 h-6 bg-blue-600 rounded-full"></div> ${s.title}</h3>
+                      <div class="space-y-2.5">
                         ${s.questions.map((q, idx) => {
                           const qId = `${s.id}-${idx}`; 
                           const isSel = state.selectedQuestionIds.includes(qId);
-                          return `<div onclick="toggleQuestion('${qId}')" class="p-6 rounded-[1.5rem] border-2 transition-all cursor-pointer flex gap-4 ${isSel ? 'border-blue-600 bg-blue-50 shadow-md' : 'border-slate-100 bg-white shadow-sm'}">
-                            <div class="w-7 h-7 rounded-full border-2 flex items-center justify-center shrink-0 mt-1 ${isSel ? 'border-blue-600 bg-blue-600' : 'border-slate-200'} text-white">${isSel ? `<i data-lucide="check" class="w-4 h-4"></i>` : ""}</div>
+                          return `<div onclick="toggleQuestion('${qId}')" class="p-4 rounded-[1.25rem] border-2 transition-all cursor-pointer flex gap-3 ${isSel ? 'border-blue-600 bg-blue-50 shadow-md' : 'border-slate-100 bg-white shadow-sm'}">
+                            <div class="w-6 h-6 rounded-full border-2 flex items-center justify-center shrink-0 mt-0.5 ${isSel ? 'border-blue-600 bg-blue-600' : 'border-slate-200'} text-white">${isSel ? `<i data-lucide="check" class="w-4 h-4"></i>` : ""}</div>
                             <p class="text-base text-slate-800 font-bold flex-1">${q}</p>
                           </div>`;
                         }).join('')}
                       </div>
                     </div>`).join('')}
                 </div>
-                <div class="p-8 bg-slate-50 border border-slate-100 rounded-[2.5rem] space-y-6 mb-4 shadow-sm">
-                  <h4 class="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><i data-lucide="plus" class="w-5 h-5"></i> 직접 질문 추가</h4>
-                  <textarea id="manual-q-input" class="w-full p-5 bg-white border border-slate-200 rounded-2xl text-lg h-32 outline-none font-medium" placeholder="엔터로 구분하여 질문을 입력하세요"></textarea>
-                  <button onclick="Actions.addManualQuestions()" class="w-full py-5 bg-dark-navy text-white rounded-2xl font-black text-xl btn-active">질문에 추가</button>
+                <div class="p-4 bg-slate-50 border border-slate-200/50 rounded-3xl space-y-2.5">
+                  <h4 class="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><i data-lucide="plus" class="w-4 h-4"></i> 직접 질문 추가</h4>
+                  <textarea id="manual-q-input" class="w-full p-4 bg-white border border-slate-200 rounded-2xl text-base h-28 outline-none resize-none font-medium" placeholder="엔터로 구분하여 질문을 입력하세요"></textarea>
+                  <button onclick="Actions.addManualQuestions()" class="w-full py-3.5 bg-dark-navy text-white rounded-2xl font-black text-lg btn-active">질문에 추가</button>
                 </div>
-                <div class="fixed bottom-0 left-0 right-0 p-6 bg-white/95 border-t max-w-[430px] mx-auto z-[60]">
-                  <button onclick="if(state.selectedQuestionIds.length > 0) setState({step: 5})" ${state.selectedQuestionIds.length === 0 ? 'disabled' : ''} class="w-full py-6 bg-blue-600 text-white rounded-2xl font-black text-xl shadow-2xl disabled:opacity-30 btn-active">선택 완료 (${state.selectedQuestionIds.length}개)</button>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="if(state.selectedQuestionIds.length > 0) setState({step: 5})" ${state.selectedQuestionIds.length === 0 ? 'disabled' : ''} class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg shadow-lg disabled:opacity-30 btn-active">선택 완료 (${state.selectedQuestionIds.length}개)</button>
                 </div>
               </div>`;
             break;
@@ -481,57 +610,57 @@
             const finalQList = [];
             [...state.aiSurveys, ...state.manualSurveys].forEach(s => s.questions.forEach((q, i) => { if(state.selectedQuestionIds.includes(`${s.id}-${i}`)) finalQList.push(q); }));
             const selectedP = [...state.aiPersonas, ...state.manualPersonas].find(p=>p.id===state.selectedPersonaId);
-            content += `<div class="pt-24 px-6 pb-44 animate-fade-in bg-white">
+            content += `<div class="pt-24 px-5 dock-space animate-fade-in bg-white">
                 ${renderHeader("인터뷰 확정", 4)}
-                <h2 class="text-3xl font-black mb-10 tracking-tight text-slate-900">최종 확인</h2>
-                <div class="bg-dark-navy p-8 rounded-[2.5rem] text-white shadow-2xl mb-12">
-                  <div class="mb-8 border-b border-white/10 pb-6"><h3 class="font-black text-2xl leading-tight">${selectedP?.name}</h3></div>
-                  <div class="space-y-5 max-h-80 overflow-y-auto pr-2 no-scrollbar font-medium">
+                <h2 class="text-3xl font-black mb-5 tracking-tight text-slate-900">최종 확인</h2>
+                <div class="bg-dark-navy p-6 rounded-[2rem] text-white shadow-xl">
+                  <div class="mb-5 border-b border-white/10 pb-4"><h3 class="font-black text-2xl leading-tight">${selectedP?.name}</h3></div>
+                  <div class="space-y-3 max-h-[50vh] overflow-y-auto pr-2 no-scrollbar font-medium">
                     ${finalQList.map((q, i) => `<div class="flex gap-4 text-base text-slate-300"><span class="font-bold text-blue-400 shrink-0">${i+1}.</span> <p>${q}</p></div>`).join('')}
                   </div>
                 </div>
-                <div class="fixed bottom-0 left-0 right-0 p-6 bg-white/95 border-t max-w-[430px] mx-auto z-[60]"><button onclick="Actions.performInterview()" class="w-full py-6 bg-blue-600 text-white rounded-2xl font-black text-xl btn-active shadow-2xl">가상 인터뷰 진행하기</button></div>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]"><button onclick="Actions.performInterview()" class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg btn-active shadow-lg">가상 인터뷰 진행하기</button></div>
               </div>`;
             break;
 
           case 6:
             const curH = state.history[state.history.length-1];
             const curPersona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId);
-            content += `<div class="pt-24 px-6 pb-80 animate-fade-in bg-white">
+            content += `<div class="pt-24 px-5 dock-space-2 animate-fade-in bg-white">
                 ${renderHeader("인터뷰 결과", 3)}
-                <div class="mb-10 p-8 bg-dark-navy rounded-[2.5rem] text-white shadow-2xl">
-                    <h2 class="text-2xl font-black mb-4 leading-tight">${curPersona.name}님 리포트</h2>
+                <div class="mb-5 p-6 bg-dark-navy rounded-[2rem] text-white shadow-xl">
+                    <h2 class="text-2xl font-black mb-3 leading-tight">${curPersona.name}님 리포트</h2>
                     <p class="text-slate-300 text-lg leading-relaxed whitespace-pre-line font-medium">${curH.result.summary}</p>
                 </div>
-                <div class="space-y-8 mb-16">
+                <div class="space-y-3 mb-5">
                   ${curH.result.qaPairs.map((qa, i) => `
-                    <div class="bg-white p-8 rounded-[2rem] border border-slate-100 shadow-sm animate-fade-in">
-                      <div class="text-blue-600 font-black text-[11px] uppercase mb-3 tracking-widest flex items-center gap-2">Question</div>
-                      <div class="text-slate-900 font-bold text-lg mb-6 leading-relaxed">${i+1}. ${qa.q}</div>
-                      <div class="text-slate-400 font-black text-[11px] uppercase mb-3 tracking-widest flex items-center gap-2">Answer</div>
+                    <div class="bg-white p-5 rounded-[1.5rem] border border-slate-100 shadow-sm animate-fade-in">
+                      <div class="text-blue-600 font-black text-[11px] uppercase mb-2 tracking-widest flex items-center gap-2">Question</div>
+                      <div class="text-slate-900 font-bold text-lg mb-4 leading-relaxed">${i+1}. ${qa.q}</div>
+                      <div class="text-slate-400 font-black text-[11px] uppercase mb-2 tracking-widest flex items-center gap-2">Answer</div>
                       <div class="text-slate-700 font-medium text-lg leading-relaxed">${qa.a}</div>
                     </div>`).join('')}
                 </div>
-                <div class="p-5 bg-blue-50/50 border border-blue-100 rounded-3xl mb-12 space-y-4">
-                  <div class="flex items-center justify-between gap-2">
+                <div class="p-4 bg-blue-50/50 border border-blue-100 rounded-3xl space-y-2.5 mb-5">
                     <h4 class="text-sm font-black text-blue-600 uppercase tracking-widest flex items-center gap-2">
                       <i data-lucide="sparkles" class="w-4 h-4"></i> 인터뷰 추가 질문
                     </h4>
-                    <button onclick="Actions.askFollowUp()" class="shrink-0 w-11 h-11 bg-blue-600 text-white rounded-xl shadow-lg flex items-center justify-center btn-active">
-                      <i data-lucide="send" class="w-5 h-5"></i>
-                    </button>
+                    <div class="flex items-center gap-2">
+                      <input type="text" id="followup-input" onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.askFollowUp();}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 3번 대답의 000에 대해 자세한 설명">
+                      <button onclick="Actions.askFollowUp()" aria-label="보내기" class="shrink-0 w-12 h-12 bg-blue-600 text-white rounded-2xl shadow-md flex items-center justify-center btn-active">
+                        <i data-lucide="send" class="w-5 h-5"></i>
+                      </button>
+                    </div>
                   </div>
-                  <input type="text" id="followup-input" class="w-full p-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 3번 대답의 000에 대해 자세한 설명">
+                <div class="p-6 bg-blue-50 border border-blue-100 rounded-[2rem] shadow-inner">
+                  <h3 class="text-blue-600 font-black text-sm uppercase tracking-widest mb-3 flex items-center gap-2"><i data-lucide="lightbulb" class="w-5 h-5"></i> Key Insights</h3>
+                  <div class="text-slate-800 font-bold text-lg leading-relaxed whitespace-pre-line">${curH.result.keyInsights}</div>
                 </div>
-                <div class="p-8 bg-blue-50 border border-blue-100 rounded-[2.5rem] mb-12 shadow-inner">
-                  <h3 class="text-blue-600 font-black text-sm uppercase tracking-widest mb-6 flex items-center gap-2"><i data-lucide="lightbulb" class="w-6 h-6"></i> Key Insights</h3>
-                  <div class="text-slate-800 font-bold text-lg leading-loose whitespace-pre-line">${curH.result.keyInsights}</div>
-                </div>
-                <div class="fixed bottom-0 left-0 right-0 p-5 bg-white border-t max-w-[430px] mx-auto space-y-3 z-[60]">
-                  <button onclick="setState({step: 3})" class="w-full py-5 bg-white border-2 border-blue-600 text-blue-600 rounded-2xl font-black text-lg flex items-center justify-center gap-3 btn-active">
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60] space-y-2">
+                  <button onclick="setState({step: 3})" class="w-full py-4 bg-white border-2 border-blue-600 text-blue-600 rounded-2xl font-black text-lg flex items-center justify-center gap-2 btn-active">
                     <i data-lucide="rotate-ccw" class="w-5 h-5"></i> 다른 타겟 인터뷰하기
                   </button>
-                  <button onclick="copyReportToClipboard()" class="w-full py-5 bg-slate-900 text-white rounded-2xl font-black text-lg shadow-xl btn-active">리포트 복사 및 인터뷰 종료</button>
+                  <button onclick="copyReportToClipboard()" class="w-full py-4 bg-slate-900 text-white rounded-2xl font-black text-lg shadow-lg btn-active">리포트 복사 및 인터뷰 종료</button>
                 </div>
               </div>`;
             break;
@@ -542,16 +671,36 @@
       }
 
       // --- BOOTSTRAP ---
-      window.onload = () => {
-        render();
-        // 5초 간격 자동 저장 설정
-        setInterval(() => {
-          if (state.step > 0) {
-            const { apiKey, isAnalyzing, errorMsg, ...dataToSave } = state;
-            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(dataToSave));
-          }
-        }, 5000);
-      };
+      // 5초 간격 자동 저장 (내용이 바뀐 경우에만) + 창을 닫을 때 저장
+      setInterval(() => { try { persist(false); } catch (e) { console.warn("자동 저장 실패", e); } }, AUTOSAVE_MS);
+      window.addEventListener("beforeunload", () => { try { persist(false); } catch (e) { /* 무시 */ } });
+      document.addEventListener("visibilitychange", () => { if (document.hidden) { try { persist(false); } catch (e) { /* 무시 */ } } });
+
+      /* 스마트폰 전체 화면 — 트렌드 인사이트 랩과 동일
+         브라우저는 사용자 터치 없이 전체 화면 전환을 허용하지 않으므로,
+         화면을 처음 터치하는 순간 전체 화면으로 전환합니다.
+         (확인 창 등으로 전체 화면이 풀리면 다음 터치 때 다시 전환) */
+      (function setupMobileFullscreen() {
+        const isMobile = window.matchMedia("(pointer: coarse)").matches || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+        const standalone = window.matchMedia("(display-mode: fullscreen), (display-mode: standalone)").matches || navigator.standalone;
+        if (!isMobile || standalone) return;
+        const root = document.documentElement;
+        const request = root.requestFullscreen || root.webkitRequestFullscreen;
+        if (!request) return;   // 아이폰은 웹페이지 전체 화면 미지원(iPad만 지원) → '홈 화면에 추가'로 주소창 없이 실행
+        const isFull = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+        const enter = () => {
+          if (isFull()) return;
+          try {
+            const r = request.call(root, { navigationUI: "hide" });
+            if (r && r.catch) r.catch(() => {});
+          } catch (e) { /* 무시 */ }
+        };
+        document.addEventListener("click", enter, true);
+        document.addEventListener("touchend", enter, { capture: true, passive: true });
+      })();
+
+      if (document.readyState === "complete") render();
+      else window.addEventListener("load", render);
 
     })();
   </script>
