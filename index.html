@@ -20,6 +20,8 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" />
 
   <style>
+    /* 당겨서 새로고침 막기 — 안드로이드 크롬은 html(루트 스크롤)에 지정해야 적용됨 */
+    html, body { overscroll-behavior: none; }
     body {
       font-family: 'Pretendard', sans-serif;
       -webkit-tap-highlight-color: transparent;
@@ -759,6 +761,27 @@
       setInterval(() => { try { persist(false); } catch (e) { console.warn("자동 저장 실패", e); } }, AUTOSAVE_MS);
       window.addEventListener("beforeunload", () => { try { persist(false); } catch (e) { /* 무시 */ } });
       document.addEventListener("visibilitychange", () => { if (document.hidden) { try { persist(false); } catch (e) { /* 무시 */ } } });
+
+      /* 당겨서 새로고침 막기 (CSS overscroll-behavior를 무시하는 브라우저용 보조 장치)
+         화면 맨 위에서 아래로 끌어내릴 때만 막고, 안쪽 스크롤 목록·입력창 스크롤은 그대로 둠 */
+      (function blockPullToRefresh() {
+        let startY = 0;
+        document.addEventListener("touchstart", (e) => {
+          if (e.touches.length === 1) startY = e.touches[0].clientY;
+        }, { passive: true });
+        document.addEventListener("touchmove", (e) => {
+          if (e.touches.length !== 1) return;
+          const pullingDown = e.touches[0].clientY - startY > 0;
+          if (!pullingDown) return;
+          const pageTop = (window.scrollY || document.documentElement.scrollTop || 0) <= 0;
+          if (!pageTop) return;
+          // 손가락 아래에 위로 더 스크롤할 수 있는 영역이 있으면 그 영역의 스크롤은 허용
+          for (let el = e.target; el && el !== document.body; el = el.parentElement) {
+            if (el.scrollTop > 0) return;
+          }
+          if (e.cancelable) e.preventDefault();
+        }, { passive: false });
+      })();
 
       /* 스마트폰 전체 화면 — 트렌드 인사이트 랩과 동일
          브라우저는 사용자 터치 없이 전체 화면 전환을 허용하지 않으므로,
