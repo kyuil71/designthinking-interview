@@ -110,12 +110,6 @@
         [FORMAT] For "keyInsights", use 1) 2) 3) format.
         Return JSON: { "summary": "Full session summary", "qaPairs": [{ "q": "Question Text", "a": "Answer Text" }], "keyInsights": "1) ... \\n 2) ..." }.`,
 
-        NAME_CLUSTERS: (topic, clusters) => `You are a Senior UX Researcher doing affinity mapping. Topic: "${topic}".
-        Below are groups of interview sentences already clustered by meaning. For each group, write a short Korean theme title (under 20 characters) and one insight sentence that explains what the group reveals about users.
-        ${clusters.map(c => `[group ${c.id}] (${c.size} sentences from ${c.people} interviewees)\n${c.samples.map(x => "- " + x).join("\n")}`).join("\n\n")}
-        [RULE] Natural Korean. No markdown bold (**). Keep every group id.
-        Return JSON: { "clusters": [{ "id": 0, "title": "Theme", "insight": "One sentence" }] }.`,
-
         GENERATE_FOLLOW_UP: (topic, persona, question) => `You are ${persona.name}. Topic: "${topic}".
         Answer the follow-up question: "${question}" in your persona's tone. 
         [RULE] Easy Korean. No markdown bold (**).
@@ -176,10 +170,7 @@
           aiSurveys: [],
           manualSurveys: [],
           selectedQuestionIds: [],
-          history: [],
-          personaInfo: {},      // 임베딩: 타겟별 주제 적합도·성향·중복
-          questionInfo: {},     // 임베딩: 질문별 관련도·중복
-          affinity: null        // 임베딩: 전체 인터뷰 인사이트 묶음
+          history: []
         };
       }
 
@@ -190,7 +181,6 @@
         isAnalyzing: false,
         loadingMsg: "",
         errorMsg: null,
-        embedBusy: "",
         ...blankProject(),
         maxStepReached: -1
       };
@@ -213,7 +203,7 @@
       let quotaWarned = false;
 
       function snapshotOf(s) {
-        const { apiKey, isAnalyzing, loadingMsg, errorMsg, embedBusy, ...data } = s;
+        const { apiKey, isAnalyzing, loadingMsg, errorMsg, ...data } = s;
         return data;
       }
       function projectTitle() {
@@ -327,179 +317,6 @@
         }
       }
 
-      // --- 임베딩 (gemini-embedding-2) — 고르는 일은 임베딩, 생각하는 일은 Flash ---
-      // 벡터는 메모리에만 두고(용량 절약), 계산 결과(점수·묶음)만 프로젝트에 저장
-      const EMBED_MODEL = "gemini-embedding-2";
-      const EMBED_DIM = 768;            // 768차원: 품질 손실이 적고 저장·계산이 가벼움
-      const EMBED_BATCH = 100;          // batchEmbedContents 한 번에 보낼 최대 개수
-      const DUP_PERSONA = 0.92;         // 이 값 이상이면 '비슷한 타겟'으로 표시
-      const DUP_QUESTION = 0.90;        // 이 값 이상이면 '비슷한 질문'으로 표시
-      const ARCHETYPES = [
-        { key: "GENERAL", label: "일반 사용자", text: "평범한 일상 속에서 제품을 무난하게 쓰는 다수의 보통 사용자. 특별한 불만이나 열정 없이 익숙한 방식을 따른다." },
-        { key: "LEAD", label: "리드 유저", text: "남들보다 먼저 새로운 기술과 방법을 시도하고 스스로 해결책을 만들어 쓰는 앞선 사용자. 미래의 요구를 먼저 겪는다." },
-        { key: "EXTREME", label: "익스트림 유저", text: "아주 많이 쓰거나 전혀 쓰지 못하는 극단의 사용자. 신체적·환경적 제약이나 강한 불편 때문에 문제를 크게 겪는다." },
-        { key: "DESIRE", label: "욕구 중심 유저", text: "기능보다 감정과 취향, 자기표현, 지위와 같은 내면의 욕구가 선택을 이끄는 사용자. 갖고 싶다는 마음이 행동을 만든다." }
-      ];
-
-      const vecCache = new Map();       // 텍스트 → 정규화된 벡터
-
-      function normalize(v) {
-        let s = 0; for (let i = 0; i < v.length; i++) s += v[i] * v[i];
-        const n = Math.sqrt(s) || 1;
-        const out = new Float32Array(v.length);
-        for (let i = 0; i < v.length; i++) out[i] = v[i] / n;
-        return out;
-      }
-      function cos(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
-      function meanVec(vs) {
-        const m = new Float32Array(vs[0].length);
-        vs.forEach(v => { for (let i = 0; i < m.length; i++) m[i] += v[i]; });
-        return normalize(m);
-      }
-
-      async function embedTexts(texts) {
-        const todo = [...new Set(texts.filter(t => !vecCache.has(t)))];
-        for (let i = 0; i < todo.length; i += EMBED_BATCH) {
-          const chunk = todo.slice(i, i + EMBED_BATCH);
-          let res;
-          for (let attempt = 0; attempt < 3; attempt++) {
-            res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:batchEmbedContents?key=${encodeURIComponent(state.apiKey || "")}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                requests: chunk.map(text => ({ model: `models/${EMBED_MODEL}`, content: { parts: [{ text }] }, outputDimensionality: EMBED_DIM }))
-              })
-            });
-            if (res.ok || [400, 401, 403, 404].includes(res.status)) break;
-            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-          }
-          if (!res.ok) throw new Error(`임베딩 요청이 거부되었습니다 (상태 ${res.status}).`);
-          const data = await res.json();
-          const embs = (data && data.embeddings) || [];
-          if (embs.length !== chunk.length) throw new Error("임베딩 응답 개수가 맞지 않습니다.");
-          chunk.forEach((t, j) => vecCache.set(t, normalize(embs[j].values)));
-        }
-        return texts.map(t => vecCache.get(t));
-      }
-
-      const personaText = (p) => `${p.name}\n${p.description}\n니즈: ${p.needs}`;
-      const allPersonas = () => [...state.aiPersonas, ...state.manualPersonas];
-      let embedWarned = false;
-      function embedFailed(err) {
-        console.warn("임베딩 실패", err);
-        if (!embedWarned) { embedWarned = true; showToast("임베딩 분석을 건너뛰었습니다. 기본 기능은 그대로 쓸 수 있습니다."); }
-      }
-
-      // 타겟 분석: 주제 적합도 + 성향 추정 + 비슷한 타겟 표시 (배경에서 실행, 화면을 막지 않음)
-      let personaRun = 0;
-      async function analyzePersonas() {
-        const ps = allPersonas();
-        if (!state.researchTopic || ps.length === 0 || !state.apiKey) return;
-        const run = ++personaRun;
-        setState({ embedBusy: "타겟 적합도 계산 중" });
-        try {
-          const [topicV, ...rest] = await embedTexts([state.researchTopic, ...ps.map(personaText), ...ARCHETYPES.map(a => a.text)]);
-          if (run !== personaRun) return;
-          const pv = rest.slice(0, ps.length);
-          const av = rest.slice(ps.length);
-          // 성향: 각 원형과의 유사도에서 타겟 전체 평균을 빼서 '주제 공통 성분'을 걷어낸 뒤 가장 두드러진 원형을 고름
-          const raw = pv.map(v => av.map(a => cos(v, a)));
-          const avg = av.map((_, k) => raw.reduce((s, r) => s + r[k], 0) / raw.length);
-          const scores = ps.map((p, i) => cos(topicV, pv[i]));
-          const sorted = [...scores].sort((a, b) => b - a);
-          const tier = (s) => {
-            const r = sorted.indexOf(s) / Math.max(1, sorted.length - 1);
-            return r <= 0.34 ? "높음" : r <= 0.67 ? "보통" : "낮음";
-          };
-          const personaInfo = {};
-          ps.forEach((p, i) => {
-            const centered = raw[i].map((x, k) => x - avg[k]);
-            const best = centered.indexOf(Math.max(...centered));
-            let dupOf = null, dupSim = 0;
-            ps.forEach((q, j) => { if (j !== i) { const s = cos(pv[i], pv[j]); if (s > dupSim) { dupSim = s; dupOf = j; } } });
-            personaInfo[p.id] = {
-              score: +scores[i].toFixed(3),
-              tier: tier(scores[i]),
-              arch: ps.length >= 3 ? ARCHETYPES[best].label : null,
-              dupWith: dupSim >= DUP_PERSONA ? dupOf + 1 : null
-            };
-          });
-          setState({ personaInfo, embedBusy: "" });
-        } catch (err) {
-          if (run === personaRun) setState({ embedBusy: "" });
-          embedFailed(err);
-        }
-      }
-
-      // 질문 분석: 주제+선택 타겟 니즈와의 관련도, 비슷한 질문 표시
-      function allQuestions() {
-        const out = [];
-        [...state.aiSurveys, ...state.manualSurveys].forEach(s => s.questions.forEach((q, idx) => out.push({ id: `${s.id}-${idx}`, text: q })));
-        return out;
-      }
-      let questionRun = 0;
-      async function analyzeQuestions() {
-        const qs = allQuestions();
-        const persona = allPersonas().find(p => p.id === state.selectedPersonaId);
-        if (!qs.length || !persona || !state.apiKey) return;
-        const run = ++questionRun;
-        setState({ embedBusy: "질문 관련도 계산 중" });
-        try {
-          const ctx = `${state.researchTopic}\n${persona.name}\n니즈: ${persona.needs}`;
-          const [ctxV, ...qv] = await embedTexts([ctx, ...qs.map(q => q.text)]);
-          if (run !== questionRun) return;
-          const questionInfo = {};
-          qs.forEach((q, i) => {
-            let dupOf = null, dupSim = 0;
-            for (let j = 0; j < i; j++) { const s = cos(qv[i], qv[j]); if (s > dupSim) { dupSim = s; dupOf = j; } }
-            questionInfo[q.id] = { rel: +cos(ctxV, qv[i]).toFixed(3), dupWith: dupSim >= DUP_QUESTION ? qs[dupOf].id : null };
-          });
-          setState({ questionInfo, embedBusy: "" });
-        } catch (err) {
-          if (run === questionRun) setState({ embedBusy: "" });
-          embedFailed(err);
-        }
-      }
-
-      // 질문 추천: 관련도와 다양성을 함께 보는 MMR 방식으로 N개 자동 선택
-      function mmrPick(rel, sim, n, lambda = 0.7) {
-        const picked = [], left = rel.map((_, i) => i);
-        while (picked.length < n && left.length) {
-          let bi = 0, bs = -Infinity;
-          left.forEach((i, li) => {
-            const red = picked.length ? Math.max(...picked.map(j => sim(i, j))) : 0;
-            const s = lambda * rel[i] - (1 - lambda) * red;
-            if (s > bs) { bs = s; bi = li; }
-          });
-          picked.push(left.splice(bi, 1)[0]);
-        }
-        return picked;
-      }
-
-      // 인사이트 묶기: 평균 연결 계층 군집 (문장 수가 수백 개 이내라 폰에서도 충분히 빠름)
-      function clusterVectors(vs, k) {
-        // 평균 연결: 합칠 때마다 거리 행렬 전체를 다시 계산하지 않고 크기 가중 평균으로 갱신
-        const n = vs.length;
-        const L = vs.map(a => Float64Array.from(vs, b => cos(a, b)));
-        const members = vs.map((_, i) => [i]);
-        const alive = new Set(members.map((_, i) => i));
-        while (alive.size > k) {
-          let bi = -1, bj = -1, bs = -Infinity;
-          for (const i of alive) for (const j of alive) if (i < j && L[i][j] > bs) { bs = L[i][j]; bi = i; bj = j; }
-          const na = members[bi].length, nb = members[bj].length;
-          for (const x of alive) if (x !== bi && x !== bj) {
-            const v = (na * L[bi][x] + nb * L[bj][x]) / (na + nb);
-            L[bi][x] = v; L[x][bi] = v;
-          }
-          members[bi] = members[bi].concat(members[bj]);
-          alive.delete(bj);
-        }
-        return [...alive].map(i => members[i]);
-      }
-      function splitSentences(text) {
-        return String(text || "").split(/(?<=[.!?。])\s+|\n+/).map(s => s.trim()).filter(s => s.length >= 12);
-      }
-
       // --- ACTIONS ---
       const Actions = {
         async validateKey() {
@@ -524,11 +341,8 @@
           const data = { ...blankProject(), ...p.data, projectId: p.id };
           const step = resumeStep(data);
           lastSaved = JSON.stringify(snapshotOf({ ...data, step }));
-          setState({ ...data, step, maxStepReached: Math.max(data.maxStepReached || 1, step), isAnalyzing: false, errorMsg: null, embedBusy: "" });
+          setState({ ...data, step, maxStepReached: Math.max(data.maxStepReached || 1, step), isAnalyzing: false, errorMsg: null });
           showToast("프로젝트를 열었습니다.");
-          // 이전 버전에서 저장한 프로젝트는 임베딩 분석을 새로 채움
-          if (allPersonas().some(p => !(state.personaInfo || {})[p.id])) analyzePersonas();
-          if (state.selectedPersonaId && [...state.aiSurveys, ...state.manualSurveys].length && !Object.keys(state.questionInfo || {}).length) analyzeQuestions();
         },
 
         deleteProject(id) {
@@ -554,7 +368,7 @@
           const userPrompt = instruction ? `Topic: ${state.researchTopic}. Instruction: ${instruction}` : state.researchTopic;
           const res = await withLoading(instruction ? "수정 지시를 반영해 타겟을 다시 제안하고 있습니다" : "주제에 맞는 인터뷰 타겟 10명을 찾고 있습니다",
             () => callGemini(PROMPTS.GENERATE_PERSONAS(state.researchTopic), userPrompt));
-          if (res) { setState({ aiPersonas: res.personas, personaInfo: {}, step: 2 }); analyzePersonas(); }
+          if (res) setState({ aiPersonas: res.personas, step: 2 });
         },
 
         addManualPersona() {
@@ -565,7 +379,6 @@
           if (!name) { showToast("이름 또는 제목을 입력해주세요."); return; }
           const newPersona = { id: 'm' + Date.now(), name: name, description: desc || "설명 정보가 없습니다.", needs: desc || "구체적인 니즈 정보가 없습니다." };
           setState({ manualPersonas: [...state.manualPersonas, newPersona] });
-          analyzePersonas();
           if (nameInput) nameInput.value = '';
           if (descInput) descInput.value = '';
         },
@@ -582,7 +395,6 @@
               selectedQuestionIds: newSelected
             });
             if (input) input.value = '';
-            analyzeQuestions();
           }
         },
 
@@ -590,7 +402,7 @@
           const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === state.selectedPersonaId);
           const res = await withLoading("선택한 타겟에 맞는 인터뷰 질문을 설계하고 있습니다",
             () => callGemini(PROMPTS.GENERATE_SURVEYS(state.researchTopic, persona), "Generate questions."));
-          if (res) { setState({ aiSurveys: res.surveys, questionInfo: {}, step: 4 }); analyzeQuestions(); }
+          if (res) setState({ aiSurveys: res.surveys, step: 4 });
         },
         
         async performInterview() {
@@ -603,48 +415,6 @@
           if (res) setState({ history: [...state.history, { personaId: persona.id, result: res }], step: 6 });
         },
         
-        // 관련도·다양성을 함께 보고 질문 N개 자동 선택 (기존 선택은 바뀜)
-        autoPickQuestions(n = 8) {
-          const qs = allQuestions();
-          const info = state.questionInfo || {};
-          if (!qs.length || qs.some(q => !info[q.id])) { showToast("질문 관련도를 계산하는 중입니다. 잠시 후 다시 눌러 주세요."); analyzeQuestions(); return; }
-          const vs = qs.map(q => vecCache.get(q.text));
-          if (vs.some(v => !v)) { showToast("질문 관련도를 다시 계산합니다. 잠시 후 다시 눌러 주세요."); analyzeQuestions(); return; }
-          const picked = mmrPick(qs.map(q => info[q.id].rel), (i, j) => cos(vs[i], vs[j]), Math.min(n, qs.length));
-          setState({ selectedQuestionIds: picked.sort((a, b) => a - b).map(i => qs[i].id) });
-          showToast(`관련도와 다양성을 고려해 ${picked.length}개를 골랐습니다.`);
-        },
-
-        // 지금까지의 모든 인터뷰 답변을 의미별로 묶고(임베딩), 묶음마다 제목·인사이트를 붙임(Flash)
-        async buildAffinity() {
-          const items = [];
-          state.history.forEach((h, hi) => (h.result.qaPairs || []).forEach(qa => splitSentences(qa.a).forEach(t => items.push({ t, who: h.personaId, hi }))));
-          // 같은 문장은 한 번만 묶되, 그 말을 한 사람은 모두 기억
-          const uniq = []; const seen = new Map();
-          items.forEach(x => { if (seen.has(x.t)) seen.get(x.t).who.add(x.who); else { const y = { t: x.t, who: new Set([x.who]) }; seen.set(x.t, y); uniq.push(y); } });
-          const list = uniq.slice(0, 300);
-          if (list.length < 6) { showToast("묶을 답변이 부족합니다. 인터뷰를 더 진행해 주세요."); return; }
-          const res = await withLoading(`인터뷰 답변 ${list.length}문장을\n의미가 비슷한 것끼리 묶고 있습니다`, async () => {
-            const vs = await embedTexts(list.map(x => x.t));
-            const k = Math.max(3, Math.min(8, Math.round(Math.sqrt(list.length / 2))));
-            const groups = clusterVectors(vs, k).filter(g => g.length >= 2).sort((a, b) => b.length - a.length);
-            const clusters = groups.map((g, id) => {
-              const c = meanVec(g.map(i => vs[i]));
-              const ranked = [...g].sort((a, b) => cos(vs[b], c) - cos(vs[a], c));
-              return { id, size: g.length, people: new Set(g.flatMap(i => [...list[i].who])).size, samples: ranked.slice(0, 6).map(i => list[i].t), rep: list[ranked[0]].t };
-            });
-            const named = await callGemini(PROMPTS.NAME_CLUSTERS(state.researchTopic, clusters), "Name the groups.");
-            const byId = {}; ((named && named.clusters) || []).forEach(c => { byId[c.id] = c; });
-            return {
-              total: list.length,
-              interviews: state.history.length,
-              builtAt: Date.now(),
-              clusters: clusters.map(c => ({ size: c.size, people: c.people, rep: c.rep, samples: c.samples.slice(1, 4), title: (byId[c.id] && byId[c.id].title) || `묶음 ${c.id + 1}`, insight: (byId[c.id] && byId[c.id].insight) || "" }))
-            };
-          });
-          if (res) setState({ affinity: res });
-        },
-
         async askFollowUp() {
           const input = document.getElementById('followup-input');
           const question = input?.value.trim(); if (!question) return;
@@ -677,12 +447,6 @@
           });
         }
         
-        if (state.affinity && state.affinity.clusters.length) {
-          txt += `[4. 인사이트 묶음 (Affinity Map, 인터뷰 ${state.affinity.interviews}건)]\n`;
-          state.affinity.clusters.forEach((c, i) => {
-            txt += `${i+1}. ${c.title} (${c.people >= 2 ? c.people + "명 공통" : "1명의 강한 의견"}, ${c.size}문장)\n   - ${c.insight}\n   - 대표 발언: "${c.rep}"\n\n`;
-          });
-        }
         const textArea = document.createElement("textarea");
         textArea.value = txt;
         document.body.appendChild(textArea);
@@ -715,59 +479,6 @@
       window.toggleQuestion = toggleQuestion;
 
       // --- RENDERERS ---
-      const TIER_CLS = { "높음": "bg-blue-600 text-white", "보통": "bg-blue-100 text-blue-700", "낮음": "bg-slate-100 text-slate-500" };
-      function embedStatus() {
-        return state.embedBusy ? `<p class="flex items-center gap-2 text-[13px] font-bold text-slate-500 mb-3" role="status"><span class="inline-block w-3 h-3 rounded-full border-2 border-blue-600 border-t-transparent animate-spin"></span>${esc(state.embedBusy)}</p>` : "";
-      }
-      function personaBadges(p) {
-        const info = (state.personaInfo || {})[p.id];
-        if (!info) return "";
-        return `<div class="flex flex-wrap gap-1.5 mb-3">
-          <span class="px-2.5 py-1 rounded-full text-[13px] font-black ${TIER_CLS[info.tier] || TIER_CLS["보통"]}">주제 적합도 ${esc(info.tier)} · ${info.score.toFixed(2)}</span>
-          ${info.arch ? `<span class="px-2.5 py-1 rounded-full text-[13px] font-bold bg-amber-50 text-amber-700 border border-amber-200">성향 추정 · ${esc(info.arch)}</span>` : ""}
-          ${info.dupWith ? `<span class="px-2.5 py-1 rounded-full text-[13px] font-bold bg-red-50 text-red-600 border border-red-200">${info.dupWith}번 타겟과 비슷함</span>` : ""}
-        </div>`;
-      }
-      function questionBadges(qId) {
-        const info = (state.questionInfo || {})[qId];
-        if (!info) return "";
-        const all = Object.values(state.questionInfo).map(x => x.rel).sort((a, b) => b - a);
-        const r = all.indexOf(info.rel) / Math.max(1, all.length - 1);
-        const tier = r <= 0.34 ? "높음" : r <= 0.67 ? "보통" : "낮음";
-        let dupNo = "";
-        if (info.dupWith) { const idx = allQuestions().findIndex(q => q.id === info.dupWith); if (idx >= 0) dupNo = `${idx + 1}번째 질문과 비슷함`; }
-        return `<div class="flex flex-wrap gap-1.5 mt-2">
-          <span class="px-2 py-0.5 rounded-full text-[13px] font-bold ${TIER_CLS[tier]}">관련도 ${tier}</span>
-          ${dupNo ? `<span class="px-2 py-0.5 rounded-full text-[13px] font-bold bg-red-50 text-red-600 border border-red-200">${dupNo}</span>` : ""}
-        </div>`;
-      }
-      function renderAffinity() {
-        const a = state.affinity;
-        const n = state.history.length;
-        const stale = a && a.interviews !== n;
-        const btn = `<button onclick="Actions.buildAffinity()" class="w-full py-3.5 ${a && !stale ? 'bg-white border-2 border-slate-300 text-slate-700' : 'bg-dark-navy text-white'} rounded-2xl font-black text-base btn-active flex items-center justify-center gap-2"><i data-lucide="layers" class="w-5 h-5"></i> ${a ? (stale ? `새 인터뷰까지 포함해 다시 묶기 (${n}건)` : "다시 묶기") : `전체 인터뷰 인사이트 묶기 (${n}건)`}</button>`;
-        if (!a) return `<div class="p-5 bg-slate-50 border border-slate-200/60 rounded-[2rem] mb-5">
-            <h3 class="text-slate-700 font-black text-sm uppercase tracking-widest mb-2 flex items-center gap-2"><i data-lucide="layers" class="w-5 h-5"></i> Affinity Map</h3>
-            <p class="text-base text-slate-600 font-medium leading-relaxed mb-4">모든 인터뷰 답변을 의미가 비슷한 것끼리 자동으로 묶고, 묶음마다 몇 명이 그 이야기를 했는지 보여 줍니다.</p>
-            ${btn}
-          </div>`;
-        return `<div class="p-5 bg-slate-50 border border-slate-200/60 rounded-[2rem] mb-5">
-            <h3 class="text-slate-700 font-black text-sm uppercase tracking-widest mb-1 flex items-center gap-2"><i data-lucide="layers" class="w-5 h-5"></i> Affinity Map</h3>
-            <p class="text-[13px] text-slate-500 font-bold mb-4">인터뷰 ${a.interviews}건 · 답변 ${a.total}문장 기준${stale ? " · 새 인터뷰 미반영" : ""}</p>
-            <div class="space-y-3 mb-4">
-              ${a.clusters.map((c, i) => `
-                <div class="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
-                  <div class="flex items-start justify-between gap-2 mb-2">
-                    <h4 class="font-black text-lg text-slate-900 leading-snug">${i + 1}. ${esc(c.title)}</h4>
-                    <span class="shrink-0 px-2.5 py-1 rounded-full text-[13px] font-black ${c.people >= 2 ? 'bg-blue-600 text-white' : 'bg-amber-50 text-amber-700 border border-amber-200'}">${c.people >= 2 ? `${c.people}명 공통` : "1명의 강한 의견"} · ${c.size}문장</span>
-                  </div>
-                  ${c.insight ? `<p class="text-base text-slate-700 font-bold leading-relaxed mb-3">${esc(c.insight)}</p>` : ""}
-                  <p class="text-base text-slate-500 font-medium italic leading-relaxed border-l-4 border-blue-200 pl-3">"${esc(c.rep)}"</p>
-                </div>`).join("")}
-            </div>
-            ${btn}
-          </div>`;
-      }
       function renderHeader(title, prevStep) {
         const canGoNext = state.step < state.maxStepReached;
         const cur = STAGES.find(x => x.n === state.step);
@@ -883,12 +594,10 @@
                 ${renderHeader("타겟 제안", 1)}
                 <h2 class="text-3xl font-black mb-2 tracking-tight text-slate-900">이런 분들은 어떠신가요?</h2>
                 <p class="text-blue-600 text-lg font-bold mb-4">리서치 전문가가 분석한 최적의 타겟 10명입니다.</p>
-                ${embedStatus()}
                 <div class="space-y-0 mb-6">
                   ${[...state.aiPersonas, ...state.manualPersonas].map((p, i) => `
                     <div class="py-7 border-b border-slate-100 animate-fade-in last:border-0">
                       <h3 class="font-black text-[22px] text-slate-900 mb-3 leading-snug">${i+1}. ${p.name}</h3>
-                      ${personaBadges(p)}
                       <p class="text-[17px] text-slate-700 font-medium mb-4 leading-relaxed whitespace-pre-line">${p.description}</p>
                       <div class="w-full bg-quote-gray px-5 py-4 rounded-2xl text-[17px] text-slate-600 font-medium italic border border-slate-200/40">
                         <span class="font-black text-slate-900 not-italic">- 주요니즈:</span> " ${p.needs} "
@@ -934,7 +643,6 @@
                         <div class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${isSel ? 'bg-blue-600 text-white shadow-lg' : 'bg-slate-100 text-slate-400'} font-black text-lg">${i + 1}</div>
                         <h3 class="font-black text-xl text-slate-900">${p.name} ${isDone ? '(완료)' : ''}</h3>
                       </div>
-                      ${personaBadges(p)}
                       <p class="text-base text-slate-600 leading-relaxed font-medium whitespace-pre-line">${p.description}</p>
                     </div>`;
                   }).join('')}
@@ -950,12 +658,7 @@
             content += `<div class="pt-[100px] px-5 dock-space animate-fade-in bg-white">
                 ${renderHeader("질문 설계", 3)}
                 <h2 class="text-3xl font-black mb-2 tracking-tight text-slate-900">인터뷰 질문 설계</h2>
-                <p class="text-blue-600 text-lg font-bold mb-4">질문들을 개별 선택하여 최적의 인터뷰를 구성하세요.</p>
-                ${embedStatus()}
-                <div class="p-4 bg-blue-50/50 border border-blue-100 rounded-3xl mb-6">
-                  <p class="text-[15px] text-slate-600 font-medium leading-relaxed mb-3">주제·타겟 니즈와 관련이 높으면서 서로 겹치지 않는 질문을 골라 줍니다.</p>
-                  <button onclick="Actions.autoPickQuestions(8)" ${state.embedBusy ? 'disabled' : ''} class="w-full py-3.5 bg-blue-600 text-white rounded-2xl font-black text-base btn-active flex items-center justify-center gap-2 disabled:opacity-40"><i data-lucide="sparkles" class="w-5 h-5"></i> 추천 질문 8개 자동 선택</button>
-                </div>
+                <p class="text-blue-600 text-lg font-bold mb-6">질문들을 개별 선택하여 최적의 인터뷰를 구성하세요.</p>
                 <div class="space-y-8 mb-6">
                   ${combinedSurveys.map(s => `
                     <div>
@@ -966,7 +669,7 @@
                           const isSel = state.selectedQuestionIds.includes(qId);
                           return `<div onclick="toggleQuestion('${qId}')" class="p-4 rounded-[1.25rem] border-2 transition-all cursor-pointer flex gap-3 ${isSel ? 'border-blue-600 bg-blue-50 shadow-md' : 'border-slate-100 bg-white shadow-sm'}">
                             <div class="w-6 h-6 rounded-full border-2 flex items-center justify-center shrink-0 mt-0.5 ${isSel ? 'border-blue-600 bg-blue-600' : 'border-slate-200'} text-white">${isSel ? `<i data-lucide="check" class="w-4 h-4"></i>` : ""}</div>
-                            <div class="flex-1"><p class="text-base text-slate-800 font-bold">${q}</p>${questionBadges(qId)}</div>
+                            <p class="text-base text-slate-800 font-bold flex-1">${q}</p>
                           </div>`;
                         }).join('')}
                       </div>
@@ -1029,11 +732,10 @@
                       </button>
                     </div>
                   </div>
-                <div class="p-6 bg-blue-50 border border-blue-100 rounded-[2rem] shadow-inner mb-5">
+                <div class="p-6 bg-blue-50 border border-blue-100 rounded-[2rem] shadow-inner">
                   <h3 class="text-blue-600 font-black text-sm uppercase tracking-widest mb-3 flex items-center gap-2"><i data-lucide="lightbulb" class="w-5 h-5"></i> Key Insights</h3>
                   <div class="text-slate-800 font-bold text-lg leading-relaxed whitespace-pre-line">${curH.result.keyInsights}</div>
                 </div>
-                ${renderAffinity()}
                 <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60] space-y-2">
                   <button onclick="setState({step: 3})" class="w-full py-4 bg-white border-2 border-blue-600 text-blue-600 rounded-2xl font-black text-lg flex items-center justify-center gap-2 btn-active">
                     <i data-lucide="rotate-ccw" class="w-5 h-5"></i> 다른 타겟 인터뷰하기
