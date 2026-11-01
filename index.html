@@ -87,20 +87,44 @@
 
       // --- PROMPT TEMPLATES ---
       const PROMPTS = {
-        GENERATE_PERSONAS: (topic) => `You are a Senior UX/User Researcher with 15 years of experience. 
-        Topic: "${topic}". Suggest exactly 10 diverse and highly professional target personas. 
-        [GOAL] Create rich, multi-dimensional user profiles that go beyond surface-level stereotypes. 
-        [STYLE] Use professional yet clear Korean suitable for design strategy documents. 
-        [STRICT FORMATTING RULE] Provide exactly 10 personas in the specified JSON structure.
-        - "name": "[인물 특성을 관통하는 전문적인 수식어] ([카테고리]): [구체적 연령/연령대]"
-        - "description": "[직업적 전문성, 일상의 리얼리티, 가치관, 디지털 리터러시, 사회적 관계성 및 행동 양식을 포함한 풍부한 맥락 설명 (3-4문장)]"
-        - "needs": "[해결하고자 하는 구체적인 기능적/정서적/심리적 요구 사항]"
-        Return JSON object: { "personas": [{ "id": "uuid", "name": "Name", "description": "Description", "needs": "Needs" }] }.`,
-        
-        GENERATE_SURVEYS: (topic, persona) => `You are an Expert UX Interviewer. Topic: "${topic}". Persona: "${persona.name}".
+        GENERATE_PERSONAS: (topic) => `You are a Senior UX/User Researcher with 15 years of experience, recruiting participants for in-depth user interviews.
+        Research topic: "${topic}"
+        Suggest exactly 10 target personas who are the RIGHT PEOPLE TO INTERVIEW about this topic.
+        [RELEVANCE — MOST IMPORTANT]
+        - Every persona must directly experience the situation in the topic right now (or did so very recently). No one who is only loosely related.
+        - If the topic already defines the target group (e.g. age, household type, occupation, condition), ALL 10 personas must stay inside that group. Do not add people outside it for the sake of diversity.
+        [DIVERSITY — WITHIN THE TOPIC]
+        - Make them differ by situation, level of experience, motivation, frequency/intensity of the problem, and coping strategy — not by drifting away from the topic.
+        - Include a mix of: mainstream users (typical experience), extreme users (the problem is most severe for them, or they avoid it entirely), and lead users (already inventing their own workarounds).
+        [CONTENT]
+        - Write with the concreteness of a design strategy document, in clear professional Korean. Avoid stereotypes.
+        - "name": "[인물 특성을 관통하는 수식어] ([사용자 유형]): [구체적 연령]"
+        - "description": 3-4 sentences. Start with how this person currently experiences the topic (concrete behaviors, recent situations, tools they use, what goes wrong), then add only the background (job, lifestyle, values, digital literacy) that explains that behavior.
+        - "needs": the functional and emotional needs this person has WITHIN THIS TOPIC, 1-2 sentences.
+        - No markdown, no asterisks.
+        Return JSON object: { "personas": [{ "name": "Name", "description": "Description", "needs": "Needs" }] }.`,
+
+        // 수정 지시 — 지금 목록을 함께 넘겨 지시에 맞게 고치게 함
+        REVISE_PERSONAS: (topic, current, instruction) => `You are a Senior UX/User Researcher. Research topic: "${topic}"
+        Below is the current list of interview target personas (numbered). Revise the list according to the user's instruction.
+        [RULES]
+        - Apply the instruction precisely. If it mentions specific numbers, change only those personas and keep the others exactly as they are.
+        - If the instruction applies to the whole list, rewrite the list accordingly.
+        - Every persona must still directly experience the situation in the topic, and stay inside the target group the topic defines.
+        - Keep the same field formats and Korean writing style. No markdown, no asterisks.
+        - Return exactly 10 personas, in order.
+        [CURRENT LIST]
+        ${current.map((p, i) => `${i + 1}. name: ${p.name}\n   description: ${p.description}\n   needs: ${p.needs}`).join("\n")}
+        Return JSON object: { "personas": [{ "name": "Name", "description": "Description", "needs": "Needs" }] }.`,
+
+        GENERATE_SURVEYS: (topic, persona) => `You are an Expert UX Interviewer. Topic: "${topic}".
+        Interviewee: "${persona.name}"
+        Background: ${persona.description}
+        Needs: ${persona.needs}
+        Tailor every question to this specific person's situation, behaviors and needs described above.
         Suggest exactly 15 in-depth interview questions organized into 3 categories (5 per category). 
         [STYLE] Write in clear, straightforward, and conversational Korean. 
-        Return JSON: { "surveys": [{ "id": "uuid", "title": "Category Title", "questions": ["Question 1", "Question 2", "..."] }] }.`,
+        Return JSON: { "surveys": [{ "title": "Category Title", "questions": ["Question 1", "Question 2", "..."] }] }.`,
 
         GENERATE_INTERVIEW: (topic, persona, questions) => `You are a Virtual User named ${persona.name}. Topic: "${topic}". 
         Context: ${persona.description}. Needs: ${persona.needs}.
@@ -259,7 +283,7 @@
         throw new Error("AI 응답을 JSON으로 해석하지 못했습니다. 다시 시도해 주세요.");
       }
 
-      async function callGemini(systemPrompt, userPrompt) {
+      async function callGemini(systemPrompt, userPrompt, temperature = 0.1) {
         const controller = new AbortController();
         activeController = controller;
         const delays = [1000, 2000, 4000, 8000];
@@ -274,7 +298,7 @@
               body: JSON.stringify({
                 contents: [{ parts: [{ text: userPrompt }] }],
                 systemInstruction: { parts: [{ text: systemPrompt }] },
-                generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
+                generationConfig: { responseMimeType: "application/json", temperature }
               })
             });
             if (!res.ok) {
@@ -365,10 +389,27 @@
         cancel() { if (activeController) activeController.abort(); },
 
         async generatePersonas(instruction = "") {
-          const userPrompt = instruction ? `Topic: ${state.researchTopic}. Instruction: ${instruction}` : state.researchTopic;
+          instruction = String(instruction || "").trim();
+          const topic = state.researchTopic;
+          const current = state.aiPersonas || [];
+          const revising = !!(instruction && current.length);
+          const system = revising ? PROMPTS.REVISE_PERSONAS(topic, current, instruction) : PROMPTS.GENERATE_PERSONAS(topic);
+          const userPrompt = revising ? `Instruction: ${instruction}` : (instruction ? `Topic: ${topic}\nAdditional instruction: ${instruction}` : `Topic: ${topic}`);
           const res = await withLoading(instruction ? "수정 지시를 반영해 타겟을 다시 제안하고 있습니다" : "주제에 맞는 인터뷰 타겟 10명을 찾고 있습니다",
-            () => callGemini(PROMPTS.GENERATE_PERSONAS(state.researchTopic), userPrompt));
-          if (res) setState({ aiPersonas: res.personas, step: 2 });
+            () => callGemini(system, userPrompt, 0.7));
+          if (!res) return;
+          const list = Array.isArray(res.personas) ? res.personas : [];
+          if (!list.length) { setState({ errorMsg: "타겟 제안을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+          // ID는 AI에게 맡기지 않고 직접 부여 — 중복 ID로 여러 명이 함께 선택되거나 인터뷰 기록이 엉키는 문제 방지
+          // 수정 시 내용이 그대로인 인물은 기존 ID를 유지해 인터뷰 완료 표시가 이어지게 함
+          const personas = list.map((p, i) => {
+            const name = String(p.name || `타겟 ${i + 1}`).replace(/\*\*/g, "").trim();
+            const same = current.find(c => c.name === name && c.description === p.description);
+            return { id: same ? same.id : uid(), name, description: String(p.description || "").replace(/\*\*/g, "").trim(), needs: String(p.needs || "").replace(/\*\*/g, "").trim() };
+          });
+          const keepSel = personas.some(p => p.id === state.selectedPersonaId);
+          setState({ aiPersonas: personas, step: 2, ...(keepSel ? {} : { selectedPersonaId: null, aiSurveys: [], manualSurveys: [], selectedQuestionIds: [] }) });
+          const box = document.getElementById('persona-inst'); if (box) box.value = "";
         },
 
         addManualPersona() {
@@ -402,7 +443,13 @@
           const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === state.selectedPersonaId);
           const res = await withLoading("선택한 타겟에 맞는 인터뷰 질문을 설계하고 있습니다",
             () => callGemini(PROMPTS.GENERATE_SURVEYS(state.researchTopic, persona), "Generate questions."));
-          if (res) setState({ aiSurveys: res.surveys, step: 4 });
+          if (!res) return;
+          const groups = Array.isArray(res.surveys) ? res.surveys : [];
+          if (!groups.length) { setState({ errorMsg: "질문 제안을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+          // 질문 묶음 ID도 직접 부여 — AI가 같은 ID를 주면 다른 묶음의 같은 번호 질문이 함께 선택되는 문제 방지
+          const base = "s" + Date.now().toString(36);
+          const surveys = groups.map((g, i) => ({ id: `${base}${i}`, title: String(g.title || `질문 ${i + 1}`), questions: (Array.isArray(g.questions) ? g.questions : []).map(q => String(q).trim()).filter(Boolean) }));
+          setState({ aiSurveys: surveys, selectedQuestionIds: state.selectedQuestionIds.filter(id => id.startsWith("m")), step: 4 });
         },
         
         async performInterview() {
@@ -412,14 +459,15 @@
           if (selectedTexts.length === 0) { showToast("질문을 선택해 주세요."); return; }
           const res = await withLoading(`선택한 타겟과 ${selectedTexts.length}개 질문으로\n가상 인터뷰를 진행하고 있습니다`,
             () => callGemini(PROMPTS.GENERATE_INTERVIEW(state.researchTopic, persona, selectedTexts), "Start interview."));
-          if (res) setState({ history: [...state.history, { personaId: persona.id, result: res }], step: 6 });
+          if (res) setState({ history: [...state.history, { personaId: persona.id, persona: { name: persona.name, description: persona.description, needs: persona.needs }, result: res }], step: 6 });
         },
         
         async askFollowUp() {
           const input = document.getElementById('followup-input');
           const question = input?.value.trim(); if (!question) return;
           const curH = state.history[state.history.length - 1];
-          const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId);
+          const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId) || curH.persona;
+          if (!persona) { showToast("인터뷰 대상 정보를 찾을 수 없습니다."); return; }
           const res = await withLoading("추가 질문에 대한 답변을 작성하는 중",
             () => callGemini(PROMPTS.GENERATE_FOLLOW_UP(state.researchTopic, persona, question), "Ask follow-up."));
           if (res) { const newH = [...state.history]; newH[newH.length-1].result.qaPairs.push(res); setState({ history: newH }); input.value = ""; }
@@ -440,7 +488,7 @@
         if (state.history.length > 0) {
           txt += `[3. 인터뷰 세션 기록]\n`;
           state.history.forEach((h, idx) => {
-            const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === h.personaId);
+            const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === h.personaId) || h.persona;
             txt += `--- 인터뷰 #${idx+1} (${persona?.name}) ---\n요약: ${h.result.summary}\n`;
             h.result.qaPairs.forEach((qa, qidx) => { txt += `${qidx+1}. Q: ${qa.q}\n   A: ${qa.a}\n`; });
             txt += `인사이트:\n${h.result.keyInsights}\n\n`;
@@ -705,7 +753,7 @@
 
           case 6:
             const curH = state.history[state.history.length-1];
-            const curPersona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId);
+            const curPersona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId) || curH.persona || { name: "인터뷰 대상", description: "", needs: "" };
             content += `<div class="pt-[100px] px-5 dock-space-2 animate-fade-in bg-white">
                 ${renderHeader("인터뷰 결과", 3)}
                 <div class="mb-5 p-6 bg-dark-navy rounded-[2rem] text-white shadow-xl">
