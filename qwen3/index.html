@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Research Lab. Qwen3</title>
+  <!-- 홈 화면에 추가해 실행하면 주소창 없이 전체 화면으로 열림 -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <!-- default: 아이폰 홈 화면 실행 시 상단 메뉴가 시계·배터리 표시줄과 겹치지 않도록 -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Research Qwen3" />
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" />
+
+  <style>
+    /* 당겨서 새로고침 막기 — 안드로이드 크롬은 html(루트 스크롤)에 지정해야 적용됨 */
+    html, body { overscroll-behavior: none; }
+    body {
+      font-family: 'Pretendard', sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior-y: none;
+      background-color: #ffffff;
+      font-size: 16px;
+    }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    @keyframes fade-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .animate-fade-in { animation: fade-in 0.4s ease-out forwards; }
+    .bg-dark-navy { background-color: #0f172a; }
+    .bg-quote-gray { background-color: #f8fafc; }
+    .border-card { border-color: #f1f5f9; }
+    .hero-title { font-size: 13.5vw; line-height: 1.1; }
+    @media (min-width: 430px) { .hero-title { font-size: 58px; } }
+    .btn-active:active { transform: scale(0.98); transition: all 0.1s; }
+    @keyframes scale-in { from { transform: scale(0.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    .animate-scale-in { animation: scale-in 0.18s ease-out forwards; }
+    /* 분석 중 표시 — 트렌드 인사이트 랩과 동일. '동작 줄이기' 설정에서도 반드시 회전 */
+    @keyframes spinner-rotate { to { transform: rotate(360deg); } }
+    .spinner-ring {
+      width: 84px; height: 84px; border-radius: 50%;
+      border: 7px solid #e2e8f0; border-top-color: #2563eb; border-right-color: #2563eb;
+      animation: spinner-rotate 0.9s linear infinite;
+      will-change: transform;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *:not(.spinner-ring), *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+      .spinner-ring { animation-duration: 1.4s !important; }
+    }
+    /* 하단 고정 버튼 영역 — 아이폰 홈 바(safe-area)만큼 여백 확보 */
+    .dock { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
+    .dock-space { padding-bottom: calc(128px + env(safe-area-inset-bottom)); }
+    .load-bar { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
+    .load-bar > div { height: 100%; background: #2563eb; border-radius: 999px; transition: width .3s; }
+    .dock-space-2 { padding-bottom: calc(196px + env(safe-area-inset-bottom)); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    (async function() {
+      // --- CONFIG & CONSTANTS ---
+      // API 키 없이 브라우저 안에서 Qwen3를 직접 실행 (WebLLM · WebGPU)
+      const WEBLLM_URL = "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.86/+esm";
+      const MODELS = {
+        "0.6B": { label: "0.6B", note: "빠름 · 약 0.4GB", detail: "가장 빠르지만 답변이 단순합니다" },
+        "1.7B": { label: "1.7B", note: "기본 · 약 1.1GB", detail: "휴대폰 권장 — 속도와 품질의 균형" },
+        "4B":   { label: "4B",   note: "고품질 · 약 2.5GB", detail: "고사양 폰·PC 권장 — 느리지만 답변이 더 풍부합니다" }
+      };
+      const DEFAULT_MODEL = "1.7B";
+      const MODEL_PREF_KEY = "research_lab_qwen3_model";
+      const PROJECTS_KEY = "research_lab_qwen3_projects_v1";   // 원래(Gemini) 버전과 저장 목록을 섞지 않음
+      const MAX_PROJECTS = 5;
+      const AUTOSAVE_MS = 5000;
+      const PERSONA_COUNT = 10;
+      const MAX_QUESTIONS = 8;
+
+      // 단계 정의 — 상단 진행 표시줄에 사용
+      const STAGES = [
+        { n: 1, label: "주제 설정" },
+        { n: 2, label: "타겟 제안" },
+        { n: 3, label: "타겟 선택" },
+        { n: 4, label: "질문 설계" },
+        { n: 5, label: "인터뷰 확정" },
+        { n: 6, label: "인터뷰 결과" }
+      ];
+
+      // --- PROMPT TEMPLATES (작은 모델용: 한 번에 하나씩, 짧고 분명하게) ---
+      // 10명이 서로 다른 사람이 되도록 칸마다 관점을 지정
+      const PERSONA_SLOTS = [
+        "20대 초반의 대학생 또는 사회초년생",
+        "30대 맞벌이 직장인",
+        "40대 자녀를 키우는 부모",
+        "60대 이상 은퇴 세대",
+        "해당 분야의 전문가 또는 업계 종사자",
+        "자영업자 또는 프리랜서",
+        "디지털 기기에 서툰 사용자",
+        "새로운 것을 가장 먼저 써 보는 얼리어답터",
+        "이 주제에서 불편을 가장 크게 겪는 극단적 사용자",
+        "1인 가구 또는 특수한 생활 환경의 사용자"
+      ];
+
+      const PROMPTS = {
+        PERSONA_SYSTEM: `당신은 15년 경력의 UX 리서처입니다. 디자인 전략 문서에 쓸 인터뷰 타겟 페르소나를 한국어로 작성합니다.
+규칙:
+- name: "[인물을 관통하는 수식어] ([카테고리]): [구체적 나이]" 형식. 예) "퇴근 후 시간을 쪼개 쓰는 효율주의자 (맞벌이 직장인): 34세"
+- description: 직업, 일상, 가치관, 디지털 활용 수준, 행동 습관이 드러나는 3문장.
+- needs: 이 사람이 해결하고 싶은 기능적·정서적 요구 1~2문장.
+- 마크다운, 별표(**), 이모지를 쓰지 마세요.
+- 반드시 JSON 객체 하나만 출력하세요.`,
+        PERSONA_USER: (topic, slot, taken, instruction) => `리서치 주제: "${topic}"
+이번 페르소나의 관점: ${slot}
+${instruction ? `추가 지시: ${instruction}
+` : ""}${taken.length ? `이미 만든 페르소나(겹치지 않게): ${taken.join(" / ")}
+` : ""}위 관점의 페르소나 1명을 JSON으로 작성하세요: {"name":"...","description":"...","needs":"..."}`,
+
+        SURVEY_SYSTEM: `당신은 숙련된 UX 인터뷰 진행자입니다. 한국어로, 짧고 쉬운 대화체 질문을 만듭니다.
+규칙:
+- 질문 그룹 2개, 그룹마다 질문 4개, 모두 8개.
+- 첫 그룹은 현재 경험과 행동, 둘째 그룹은 불편·감정·바라는 점.
+- 예/아니오로 끝나지 않는 열린 질문. 같은 뜻의 질문을 반복하지 마세요.
+- 마크다운, 번호, 이모지를 쓰지 마세요. 반드시 JSON 객체 하나만 출력하세요.`,
+        SURVEY_USER: (topic, persona) => `리서치 주제: "${topic}"
+인터뷰 대상: ${persona.name}
+대상 설명: ${persona.description}
+JSON 형식: {"surveys":[{"title":"그룹 제목","questions":["질문1","질문2","질문3","질문4"]},{"title":"그룹 제목","questions":["질문1","질문2","질문3","질문4"]}]}`,
+
+        ANSWER_SYSTEM: (topic, persona) => `당신은 지금 인터뷰를 받고 있는 실제 사람 "${persona.name}"입니다. AI라고 밝히지 마세요.
+나에 대한 설명: ${persona.description}
+내가 바라는 것: ${persona.needs}
+인터뷰 주제: "${topic}"
+답변 규칙:
+- 1인칭, 자연스러운 존댓말 구어체 한국어로 4~5문장.
+- 내 일상에서 실제 있었던 구체적인 에피소드를 하나 꼭 넣으세요 (언제, 어디서, 무엇을 했는지).
+- 앞에서 한 말과 모순되지 않게 하세요. 같은 문장을 반복하지 마세요.
+- 마크다운, 별표(**), 목록, 이모지 없이 문단 하나로만 답하세요.`,
+
+        SUMMARY_SYSTEM: `당신은 UX 리서치 분석가입니다. 인터뷰 기록을 읽고 한국어로 정리합니다.
+- summary: 이 사람의 핵심 행동과 감정을 담은 요약 3~4문장.
+- insights: 디자인에 바로 쓸 수 있는 핵심 인사이트 3개, 각 1~2문장.
+- 마크다운, 별표(**), 이모지를 쓰지 마세요. 반드시 JSON 객체 하나만 출력하세요.`
+      };
+
+      const SCHEMA = {
+        persona: { type: "object", properties: { name: { type: "string" }, description: { type: "string" }, needs: { type: "string" } }, required: ["name", "description", "needs"] },
+        surveys: { type: "object", properties: { surveys: { type: "array", items: { type: "object", properties: { title: { type: "string" }, questions: { type: "array", items: { type: "string" } } }, required: ["title", "questions"] } } }, required: ["surveys"] },
+        summary: { type: "object", properties: { summary: { type: "string" }, insights: { type: "array", items: { type: "string" } } }, required: ["summary", "insights"] }
+      };
+
+      const uid = () => "p_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+      const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+      // --- 저장소 — 트렌드 인사이트 랩과 같은 슬롯 방식(최대 5개) + 용량 처리 ---
+      const Store = {
+        list() {
+          try {
+            const raw = localStorage.getItem(PROJECTS_KEY);
+            const arr = raw ? JSON.parse(raw) : [];
+            return Array.isArray(arr) ? arr : [];
+          } catch (e) { console.warn("저장 목록을 읽지 못했습니다.", e); return []; }
+        },
+        _write(list) {
+          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(list)); return true; }
+          catch (e) { return false; }
+        },
+        save(snapshot, meta) {
+          let list = Store.list().filter(p => p.id !== meta.id);
+          list.unshift({ id: meta.id, title: meta.title, savedAt: Date.now(), data: snapshot });
+          if (list.length > MAX_PROJECTS) list = list.slice(0, MAX_PROJECTS);
+          if (Store._write(list)) return { ok: true };
+          // 용량 초과: 가장 오래된 프로젝트를 버리고 재시도
+          const reduced = list.slice(0, Math.max(1, list.length - 1));
+          if (Store._write(reduced)) return { ok: true, pruned: "oldest" };
+          return { ok: false };
+        },
+        remove(id) { return Store._write(Store.list().filter(p => p.id !== id)); }
+      };
+
+      function blankProject() {
+        return {
+          projectId: uid(),
+          maxStepReached: 1,
+          researchTopic: "",
+          aiPersonas: [],
+          manualPersonas: [],
+          selectedPersonaId: null,
+          aiSurveys: [],
+          manualSurveys: [],
+          selectedQuestionIds: [],
+          history: []
+        };
+      }
+
+      // --- GLOBAL STATE ---
+      let state = {
+        step: 0,
+        modelSize: (() => { try { const v = localStorage.getItem(MODEL_PREF_KEY); return MODELS[v] ? v : DEFAULT_MODEL; } catch (e) { return DEFAULT_MODEL; } })(),
+        isAnalyzing: false,
+        loadingMsg: "",
+        errorMsg: null,
+        ...blankProject(),
+        maxStepReached: 0
+      };
+
+      window.state = state;
+
+      // --- STATE MANAGEMENT ---
+      function setState(newState) {
+        const prevStep = state.step;
+        if (newState.step !== undefined) state.maxStepReached = Math.max(state.maxStepReached, newState.step);
+        state = { ...state, ...newState }; 
+        window.state = state;
+        render(); 
+        if (newState.step !== undefined && newState.step !== prevStep) window.scrollTo(0, 0);
+      }
+      window.setState = setState;
+
+      // --- 자동 저장 ---
+      let lastSaved = "";
+      let quotaWarned = false;
+
+      function snapshotOf(s) {
+        const { isAnalyzing, loadingMsg, errorMsg, modelSize, ...data } = s;
+        return data;
+      }
+      function projectTitle() {
+        if (state.researchTopic) return state.researchTopic.slice(0, 40);
+        return "제목 없는 프로젝트";
+      }
+      // 저장해 둔 단계가 데이터와 맞지 않으면 갈 수 있는 마지막 단계로 보정
+      function resumeStep(d) {
+        const has = (a) => Array.isArray(a) && a.length > 0;
+        const hasPersonas = has(d.aiPersonas) || has(d.manualPersonas);
+        const ok = {
+          1: true,
+          2: hasPersonas,
+          3: hasPersonas,
+          4: !!d.selectedPersonaId && (has(d.aiSurveys) || has(d.manualSurveys)),
+          5: !!d.selectedPersonaId && has(d.selectedQuestionIds),
+          6: has(d.history)
+        };
+        let s = parseInt(d.step, 10);
+        if (!(s >= 1 && s <= 6)) s = 6;
+        while (s > 1 && !ok[s]) s--;
+        return s;
+      }
+      function persist(force) {
+        if (state.step < 1) return "skip";
+        // 주제도 결과도 없는 빈 프로젝트는 목록을 차지하지 않도록 저장하지 않음
+        if (!state.researchTopic && !state.aiPersonas.length && !state.manualPersonas.length) return "skip";
+        const snap = snapshotOf(state);
+        const serialized = JSON.stringify(snap);
+        if (!force && serialized === lastSaved) return "skip";
+        const r = Store.save(snap, { id: state.projectId, title: projectTitle() });
+        if (r.ok) {
+          lastSaved = serialized;
+          if (r.pruned === "oldest" && !quotaWarned) { quotaWarned = true; showToast("공간 확보를 위해 가장 오래된 프로젝트를 정리했습니다."); }
+          return "ok";
+        }
+        if (!quotaWarned) { quotaWarned = true; showToast("저장 공간이 부족해 자동 저장이 중단되었습니다."); }
+        return "full";
+      }
+
+      // --- AI 실행 — Qwen3를 브라우저 안에서 직접 실행 (API 키 불필요) ---
+      let webllm = null;
+      let engine = null;
+      let engineModelId = null;
+      let enginePromise = null;
+      let runId = 0;          // 작업마다 번호를 붙여, 취소되거나 새 작업이 시작되면 이전 작업은 스스로 멈춤
+      let wakeLock = null;
+
+      // 로딩 화면의 진행률·미리보기 — 글자가 나올 때마다 전체를 다시 그리지 않고 해당 부분만 갱신
+      const progress = { pct: null, detail: "", preview: "" };
+      function paintProgress() {
+        const bar = document.getElementById("load-bar");
+        const pctEl = document.getElementById("load-pct");
+        const det = document.getElementById("load-detail");
+        const pre = document.getElementById("load-preview");
+        if (bar) { bar.parentElement.parentElement.style.display = progress.pct == null ? "none" : ""; bar.style.width = (progress.pct || 0) + "%"; }
+        if (pctEl) pctEl.textContent = progress.pct == null ? "" : progress.pct + "%";
+        if (det) det.textContent = progress.detail;
+        if (pre) { pre.textContent = progress.preview; pre.style.display = progress.preview ? "" : "none"; pre.scrollTop = pre.scrollHeight; }
+      }
+      function setProgress(p) { Object.assign(progress, p); paintProgress(); }
+      function resetProgress() { progress.pct = null; progress.detail = ""; progress.preview = ""; }
+
+      function abortedError() { const e = new Error("__aborted__"); e.aborted = true; return e; }
+      function checkCancel(my) { if (my !== runId) throw abortedError(); }
+
+      async function supportsF16() {
+        try { const a = await navigator.gpu.requestAdapter(); return !!(a && a.features && a.features.has("shader-f16")); }
+        catch (e) { return false; }
+      }
+
+      async function modelIdFor(size) {
+        return `Qwen3-${size}-${(await supportsF16()) ? "q4f16_1" : "q4f32_1"}-MLC`;
+      }
+
+      async function ensureEngine() {
+        if (!("gpu" in navigator)) {
+          throw new Error("이 브라우저에서는 AI 모델을 실행할 수 없습니다 (WebGPU 미지원).\n안드로이드 최신 크롬, 또는 PC의 크롬·엣지에서 열어 주세요.");
+        }
+        const wanted = await modelIdFor(state.modelSize);
+        if (engine && engineModelId === wanted) return engine;
+        if (enginePromise) { await enginePromise.catch(() => {}); if (engine && engineModelId === wanted) return engine; }
+        enginePromise = (async () => {
+          setProgress({ pct: 0, detail: "AI 모델을 준비하고 있습니다", preview: "" });
+          if (!webllm) webllm = window.__webllmMock || await import(WEBLLM_URL);
+          if (engine) { try { await engine.unload(); } catch (e) { /* 무시 */ } engine = null; engineModelId = null; }
+          const eng = await webllm.CreateMLCEngine(wanted, {
+            initProgressCallback: (r) => {
+              const pct = Math.max(0, Math.min(100, Math.round((r.progress || 0) * 100)));
+              const fetching = /fetch|download/i.test(r.text || "");
+              setProgress({ pct, detail: fetching ? `Qwen3 ${state.modelSize} 모델 내려받는 중 (처음 한 번만)` : `Qwen3 ${state.modelSize} 모델 불러오는 중` });
+            }
+          });
+          engine = eng; engineModelId = wanted;
+          return eng;
+        })();
+        try { return await enginePromise; }
+        catch (e) {
+          throw new Error(`AI 모델을 불러오지 못했습니다.\n${/memory|OOM|device|lost|alloc/i.test(String(e && e.message)) ? "이 기기에서 메모리가 부족합니다. 홈 화면에서 더 작은 모델(0.6B)을 골라 보세요." : (e && e.message) || "네트워크 상태를 확인해 주세요."}`);
+        }
+        finally { enginePromise = null; setProgress({ pct: null }); }
+      }
+
+      function parseModelJson(text) {
+        let t = String(text).replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+        t = t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+        try { return JSON.parse(t); } catch (e) { /* 아래에서 구간 추출 재시도 */ }
+        const first = Math.min(...[t.indexOf("{"), t.indexOf("[")].filter(i => i >= 0));
+        const last = Math.max(t.lastIndexOf("}"), t.lastIndexOf("]"));
+        if (Number.isFinite(first) && last > first) {
+          try { return JSON.parse(t.slice(first, last + 1)); } catch (e) { /* fallthrough */ }
+        }
+        throw new Error("AI 응답을 해석하지 못했습니다. 다시 시도해 주세요.");
+      }
+
+      const cleanText = (t) => String(t || "")
+        .replace(/<think>[\s\S]*?<\/think>/g, "")
+        .replace(/\*\*/g, "").replace(/^#+\s*/gm, "")
+        .replace(/^\s*(A|답변|대답)\s*[:：]\s*/i, "")
+        .trim();
+
+      // 한 번의 AI 호출. schema를 주면 그 형식의 JSON만 나오도록 강제 (작은 모델의 형식 깨짐 방지)
+      async function llm(system, user, { schema = null, maxTokens = 600, temperature = 0.7, onText = null } = {}) {
+        const my = runId;
+        await ensureEngine();
+        checkCancel(my);
+        const req = {
+          messages: [{ role: "system", content: system }, { role: "user", content: user }],
+          temperature, top_p: 0.8, presence_penalty: 0.6,
+          max_tokens: maxTokens,
+          stream: true,
+          extra_body: { enable_thinking: false }
+        };
+        if (schema) req.response_format = { type: "json_object", schema: JSON.stringify(schema) };
+        const chunks = await engine.chat.completions.create(req);
+        let text = "";
+        for await (const c of chunks) {
+          text += (c.choices && c.choices[0] && c.choices[0].delta && c.choices[0].delta.content) || "";
+          if (onText && my === runId) onText(text);
+        }
+        checkCancel(my);
+        if (!text.trim()) throw new Error("AI가 빈 응답을 반환했습니다. 다시 시도해 주세요.");
+        return schema ? parseModelJson(text) : cleanText(text);
+      }
+
+      // 단계별 로딩 메시지를 띄우고 작업이 끝나면 닫음
+      async function withLoading(msg, fn) {
+        const my = ++runId;
+        resetProgress();
+        setState({ isAnalyzing: true, loadingMsg: msg, errorMsg: null });
+        try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* 무시 */ }
+        try {
+          const out = await fn();
+          if (my !== runId) return null;
+          setState({ isAnalyzing: false });
+          return out;
+        } catch (err) {
+          if ((err && err.aborted) || my !== runId) { return null; }
+          console.error(err);
+          setState({ isAnalyzing: false, errorMsg: err.message || "분석에 실패했습니다." });
+          return null;
+        } finally {
+          try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) { /* 무시 */ }
+          resetProgress();
+        }
+      }
+
+      const truncate = (t, n) => { t = String(t || ""); return t.length > n ? t.slice(0, n) + "…" : t; };
+
+      // --- ACTIONS ---
+      const Actions = {
+        setModel(size) {
+          if (!MODELS[size] || state.isAnalyzing) return;
+          try { localStorage.setItem(MODEL_PREF_KEY, size); } catch (e) { /* 무시 */ }
+          setState({ modelSize: size });
+        },
+
+        async prepareModel() {
+          const ok = await withLoading(`Qwen3 ${state.modelSize} 모델을 준비하고 있습니다`, async () => { await ensureEngine(); return true; });
+          if (ok) showToast("AI 모델 준비가 끝났습니다.");
+        },
+
+        openProject(id) {
+          const p = Store.list().find(x => x.id === id);
+          if (!p) { showToast("해당 프로젝트를 찾을 수 없습니다."); return; }
+          const data = { ...blankProject(), ...p.data, projectId: p.id };
+          const step = resumeStep(data);
+          lastSaved = JSON.stringify(snapshotOf({ ...data, step }));
+          setState({ ...data, step, maxStepReached: Math.max(data.maxStepReached || 1, step), isAnalyzing: false, errorMsg: null });
+          showToast("프로젝트를 열었습니다.");
+        },
+
+        deleteProject(id) {
+          if (!confirm("이 프로젝트를 삭제할까요? 되돌릴 수 없습니다.")) return;
+          showToast(Store.remove(id) ? "프로젝트를 삭제했습니다." : "삭제에 실패했습니다.");
+          render();
+        },
+
+        goHome() {
+          if (state.isAnalyzing) return;
+          persist(true);
+          setState({ step: 0 });
+        },
+
+        startNewProject() {
+          lastSaved = "";
+          setState({ ...blankProject(), step: 1, isAnalyzing: false, errorMsg: null });
+        },
+
+        cancel() {
+          if (!state.isAnalyzing) return;
+          runId++;
+          try { if (engine) engine.interruptGenerate(); } catch (e) { /* 무시 */ }
+          setState({ isAnalyzing: false });
+          showToast("분석을 취소했습니다.");
+        },
+
+        async generatePersonas(instruction = "") {
+          const topic = state.researchTopic;
+          const res = await withLoading(instruction ? "수정 지시를 반영해 타겟을 다시 제안하고 있습니다" : `주제에 맞는 인터뷰 타겟 ${PERSONA_COUNT}명을 찾고 있습니다`, async () => {
+            const list = [];
+            for (let i = 0; i < PERSONA_COUNT; i++) {
+              setProgress({ detail: `타겟 ${i + 1} / ${PERSONA_COUNT} 작성 중`, preview: "" });
+              const taken = list.map(p => p.name.split(":")[0].trim());
+              const r = await llm(PROMPTS.PERSONA_SYSTEM, PROMPTS.PERSONA_USER(topic, PERSONA_SLOTS[i % PERSONA_SLOTS.length], taken, instruction), {
+                schema: SCHEMA.persona, maxTokens: 420,
+                onText: (t) => setProgress({ preview: t.replace(/[{}"]/g, "").replace(/\b(name|description|needs)\s*:/g, "\n").trim() })
+              });
+              list.push({ id: uid(), name: cleanText(r.name) || `타겟 ${i + 1}`, description: cleanText(r.description), needs: cleanText(r.needs) });
+            }
+            return list;
+          });
+          if (res) setState({ aiPersonas: res, step: 2 });
+        },
+
+        addManualPersona() {
+          const nameInput = document.getElementById('manual-p-name');
+          const descInput = document.getElementById('manual-p-desc');
+          const name = nameInput?.value.trim();
+          const desc = descInput?.value.trim();
+          if (!name) { showToast("이름 또는 제목을 입력해주세요."); return; }
+          const newPersona = { id: 'm' + Date.now(), name: name, description: desc || "설명 정보가 없습니다.", needs: desc || "구체적인 니즈 정보가 없습니다." };
+          setState({ manualPersonas: [...state.manualPersonas, newPersona] });
+          if (nameInput) nameInput.value = '';
+          if (descInput) descInput.value = '';
+        },
+
+        addManualQuestions() {
+          const input = document.getElementById('manual-q-input');
+          const v = input?.value;
+          if (v) {
+            const list = v.split('\n').map(x => x.trim()).filter(x => x);
+            const nid = 'm' + Date.now();
+            // 인터뷰는 최대 8개 — 남은 칸만큼만 자동 선택
+            const room = Math.max(0, MAX_QUESTIONS - state.selectedQuestionIds.length);
+            const newSelected = [...state.selectedQuestionIds, ...list.slice(0, room).map((_, i) => nid + '-' + i)];
+            if (list.length > room) showToast(`인터뷰 질문은 최대 ${MAX_QUESTIONS}개까지 선택됩니다.`);
+            setState({
+              manualSurveys: [...state.manualSurveys, { id: nid, title: '사용자 추가 질문', questions: list }],
+              selectedQuestionIds: newSelected
+            });
+            if (input) input.value = '';
+          }
+        },
+
+        async generateSurveys() {
+          const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === state.selectedPersonaId);
+          if (!persona) return;
+          const res = await withLoading(`선택한 타겟에 맞는 인터뷰 질문 ${MAX_QUESTIONS}개를 설계하고 있습니다`, async () => {
+            setProgress({ detail: "질문 작성 중" });
+            const r = await llm(PROMPTS.SURVEY_SYSTEM, PROMPTS.SURVEY_USER(state.researchTopic, persona), {
+              schema: SCHEMA.surveys, maxTokens: 700,
+              onText: (t) => setProgress({ preview: t.replace(/[{}\[\]"]/g, "").replace(/\b(surveys|title|questions)\s*:/g, "\n").replace(/,\s*/g, "\n").trim() })
+            });
+            // 2개 그룹 × 4개 = 8개로 정리 (모자라거나 넘치면 맞춤)
+            const groups = (r.surveys || []).map(g => ({ title: cleanText(g.title) || "인터뷰 질문", questions: (g.questions || []).map(cleanText).filter(Boolean) })).filter(g => g.questions.length);
+            const all = []; groups.forEach(g => g.questions.forEach(q => { if (!all.includes(q)) all.push(q); }));
+            if (!all.length) throw new Error("질문을 만들지 못했습니다. 다시 시도해 주세요.");
+            const top = all.slice(0, MAX_QUESTIONS);
+            const out = []; let k = 0;
+            groups.forEach((g, gi) => {
+              const qs = g.questions.filter(q => top.includes(q) && !out.some(o => o.questions.includes(q)));
+              if (qs.length) out.push({ id: "s" + Date.now().toString(36) + gi, title: g.title, questions: qs });
+            });
+            return out;
+          });
+          if (res) {
+            const ids = []; res.forEach(s => s.questions.forEach((_, i) => ids.push(`${s.id}-${i}`)));
+            setState({ aiSurveys: res, manualSurveys: [], selectedQuestionIds: ids.slice(0, MAX_QUESTIONS), step: 4 });
+          }
+        },
+
+        async performInterview() {
+          const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === state.selectedPersonaId);
+          const allQ = []; [...state.aiSurveys, ...state.manualSurveys].forEach(s => s.questions.forEach((q, idx) => allQ.push({ id: `${s.id}-${idx}`, text: q })));
+          const selectedTexts = allQ.filter(q => state.selectedQuestionIds.includes(q.id)).map(q => q.text).slice(0, MAX_QUESTIONS);
+          if (selectedTexts.length === 0) { showToast("질문을 선택해 주세요."); return; }
+          const topic = state.researchTopic;
+          const res = await withLoading(`선택한 타겟과 ${selectedTexts.length}개 질문으로\n가상 인터뷰를 진행하고 있습니다`, async () => {
+            const qaPairs = [];
+            for (let i = 0; i < selectedTexts.length; i++) {
+              const q = selectedTexts[i];
+              setProgress({ detail: `질문 ${i + 1} / ${selectedTexts.length} 답변 작성 중`, preview: "" });
+              // 앞에서 한 말을 짧게 넘겨 답변끼리 모순되지 않게 함
+              const before = qaPairs.slice(-3).map(x => `- ${truncate(x.q, 40)} → ${truncate(x.a, 90)}`).join("\n");
+              const a = await llm(PROMPTS.ANSWER_SYSTEM(topic, persona), `${before ? `내가 앞에서 한 말:\n${before}\n\n` : ""}인터뷰 질문: ${q}`, {
+                maxTokens: 380, temperature: 0.8,
+                onText: (t) => setProgress({ preview: cleanText(t) })
+              });
+              qaPairs.push({ q, a });
+            }
+            setProgress({ detail: "요약과 핵심 인사이트 정리 중", preview: "" });
+            const log = qaPairs.map((x, i) => `${i + 1}. Q: ${x.q}\nA: ${truncate(x.a, 160)}`).join("\n");
+            const s = await llm(PROMPTS.SUMMARY_SYSTEM, `인터뷰 대상: ${persona.name}\n주제: "${topic}"\n\n${log}\n\nJSON 형식: {"summary":"...","insights":["...","...","..."]}`, {
+              schema: SCHEMA.summary, maxTokens: 600, temperature: 0.5,
+              onText: (t) => setProgress({ preview: t.replace(/[{}\[\]"]/g, "").replace(/\b(summary|insights)\s*:/g, "\n").trim() })
+            });
+            const insights = (s.insights || []).map(cleanText).filter(Boolean).slice(0, 3);
+            return { summary: cleanText(s.summary), qaPairs, keyInsights: insights.map((x, i) => `${i + 1}) ${x.replace(/^\d+\)\s*/, "")}`).join("\n") };
+          });
+          if (res) setState({ history: [...state.history, { personaId: persona.id, result: res }], step: 6 });
+        },
+
+        async askFollowUp() {
+          const input = document.getElementById('followup-input');
+          const question = input?.value.trim(); if (!question) return;
+          const curH = state.history[state.history.length - 1];
+          const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId);
+          const res = await withLoading("추가 질문에 대한 답변을 작성하는 중", async () => {
+            const before = curH.result.qaPairs.map((x, i) => `${i + 1}. ${truncate(x.q, 40)} → ${truncate(x.a, 80)}`).join("\n");
+            const a = await llm(PROMPTS.ANSWER_SYSTEM(state.researchTopic, persona), `내가 앞에서 한 말:\n${before}\n\n추가 질문: ${question}`, {
+              maxTokens: 380, temperature: 0.8,
+              onText: (t) => setProgress({ detail: "답변 작성 중", preview: cleanText(t) })
+            });
+            return { q: question, a };
+          });
+          if (res) { const newH = [...state.history]; newH[newH.length-1].result.qaPairs.push(res); setState({ history: newH }); const el = document.getElementById('followup-input'); if (el) el.value = ""; }
+        }
+      };
+      window.Actions = Actions;
+
+      // --- CLIPBOARD UTILITY ---
+      function copyReportToClipboard() {
+        let txt = "==================================================\n   RESEARCH LAB. 분석 리포트\n==================================================\n\n";
+        txt += `[1. 리서치 주제]\n- ${state.researchTopic || "설정된 주제 없음"}\n\n`;
+        if (state.aiPersonas.length > 0 || state.manualPersonas.length > 0) {
+          txt += `[2. 제안된 타겟 리스트]\n`;
+          [...state.aiPersonas, ...state.manualPersonas].forEach((p, i) => {
+            txt += `${i+1}. ${p.name}\n   - 설명: ${p.description}\n   - 주요니즈: ${p.needs}\n\n`;
+          });
+        }
+        if (state.history.length > 0) {
+          txt += `[3. 인터뷰 세션 기록]\n`;
+          state.history.forEach((h, idx) => {
+            const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === h.personaId);
+            txt += `--- 인터뷰 #${idx+1} (${persona?.name}) ---\n요약: ${h.result.summary}\n`;
+            h.result.qaPairs.forEach((qa, qidx) => { txt += `${qidx+1}. Q: ${qa.q}\n   A: ${qa.a}\n`; });
+            txt += `인사이트:\n${h.result.keyInsights}\n\n`;
+          });
+        }
+        
+        const textArea = document.createElement("textarea");
+        textArea.value = txt;
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+          document.execCommand('copy');
+          showToast("리포트가 클립보드에 복사되었습니다.");
+        } catch (err) {
+          showToast("복사 실패. 다시 시도해 주세요.");
+        }
+        document.body.removeChild(textArea);
+      }
+      window.copyReportToClipboard = copyReportToClipboard;
+
+      function showToast(message) {
+        const toast = document.createElement("div");
+        toast.innerText = message;
+        toast.className = "fixed left-1/2 -translate-x-1/2 bg-black/80 text-white px-6 py-3 rounded-full text-sm font-bold z-[10000] animate-fade-in shadow-xl whitespace-nowrap";
+        toast.style.bottom = "calc(112px + env(safe-area-inset-bottom))";
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 2500);
+      }
+      window.showToast = showToast;
+
+      function toggleQuestion(id) {
+        let newList = [...state.selectedQuestionIds];
+        if (!newList.includes(id) && newList.length >= MAX_QUESTIONS) { showToast(`인터뷰 질문은 최대 ${MAX_QUESTIONS}개까지 고를 수 있습니다.`); return; }
+        newList = newList.includes(id) ? newList.filter(x => x !== id) : [...newList, id];
+        setState({ selectedQuestionIds: newList });
+      }
+      window.toggleQuestion = toggleQuestion;
+
+      // --- RENDERERS ---
+      function renderHeader(title, prevStep) {
+        const canGoNext = state.step < state.maxStepReached;
+        const cur = STAGES.find(x => x.n === state.step);
+        const pct = cur ? Math.round((cur.n / STAGES.length) * 100) : 0;
+        return `
+          <header class="fixed top-0 left-0 right-0 z-50 bg-white/95 backdrop-blur-md border-b border-slate-100 max-w-[430px] mx-auto">
+            <div class="px-3 h-14 flex items-center justify-between gap-1">
+              <div class="flex items-center gap-0.5 min-w-0 flex-1">
+                <button onclick="setState({step: ${prevStep}})" aria-label="이전 단계로" class="p-2 rounded-full hover:bg-slate-50 transition-all shrink-0"><i data-lucide="chevron-left" class="w-7 h-7 text-slate-500"></i></button>
+                ${canGoNext ? `<button onclick="setState({step: ${state.step + 1}})" aria-label="다음 단계로" class="p-2 rounded-full hover:bg-slate-50 text-slate-500 transition-all shrink-0"><i data-lucide="chevron-right" class="w-7 h-7"></i></button>` : ""}
+                <h1 class="text-base truncate ml-1 font-black">${title}</h1>
+              </div>
+              <div class="flex items-center gap-0.5 shrink-0">
+                <button onclick="copyReportToClipboard()" aria-label="리포트 복사" class="p-2 rounded-full hover:bg-slate-100 text-slate-500 transition-all"><i data-lucide="copy" class="w-6 h-6"></i></button>
+                <button onclick="Actions.goHome()" aria-label="홈으로 (저장)" class="p-2 rounded-full hover:bg-slate-100 text-slate-500 transition-all"><i data-lucide="home" class="w-6 h-6"></i></button>
+              </div>
+            </div>
+            ${cur ? `<div class="px-4 pb-2 flex items-center gap-3">
+              <div class="h-1.5 bg-slate-200 rounded-full flex-1 overflow-hidden"><div class="h-full bg-blue-600 rounded-full transition-all" style="width:${pct}%"></div></div>
+              <span class="text-[13px] font-bold text-slate-500 tabular-nums shrink-0">${cur.n} / ${STAGES.length} · ${esc(cur.label)}</span>
+            </div>` : ""}
+          </header>`;
+      }
+
+      function render() {
+        const root = document.getElementById('root');
+        let content = "";
+        
+        if (state.isAnalyzing) {
+          content = `<div class="fixed inset-0 z-[10000] bg-white/95 backdrop-blur-sm flex flex-col items-center justify-center px-8 text-center max-w-[430px] mx-auto animate-fade-in" role="status" aria-live="polite">
+              <div class="spinner-ring mb-8" role="presentation"></div>
+              <h2 class="text-[22px] leading-snug font-extrabold tracking-tight text-slate-900 mb-3 w-full whitespace-pre-line">${esc(state.loadingMsg || "AI 분석 중")}</h2>
+              <p id="load-detail" class="text-base font-bold text-blue-600 mb-3 w-full">${esc(progress.detail)}</p>
+              <div class="w-full mb-4 flex items-center gap-3" style="${progress.pct == null ? "display:none" : ""}">
+                <div class="load-bar flex-1"><div id="load-bar" style="width:${progress.pct || 0}%"></div></div>
+                <span id="load-pct" class="text-sm font-bold text-slate-500 tabular-nums w-10 text-right">${progress.pct == null ? "" : progress.pct + "%"}</span>
+              </div>
+              <div id="load-preview" class="w-full max-h-36 overflow-y-auto no-scrollbar text-left text-[15px] leading-relaxed text-slate-600 bg-slate-50 border border-slate-100 rounded-2xl px-4 py-3 mb-4 whitespace-pre-line" style="${progress.preview ? "" : "display:none"}">${esc(progress.preview)}</div>
+              <p class="text-base text-slate-500 mb-2 w-full">휴대폰 안에서 AI가 직접 작성해 몇 분 걸릴 수 있습니다</p>
+              <p class="text-base text-slate-500 mb-8 w-full">처리 중에는 화면을 켜 두고 다른 앱으로 전환하지 마세요</p>
+              <button type="button" onclick="Actions.cancel()" class="px-7 py-3.5 rounded-2xl border-2 border-slate-300 text-slate-700 font-bold text-base hover:bg-slate-50 active:scale-95 transition-all">취소</button>
+            </div>`;
+        }
+        if (state.errorMsg) {
+          content += `<div class="fixed inset-0 z-[10002] flex items-center justify-center bg-black/50 px-6 backdrop-blur-sm" role="alertdialog" aria-modal="true">
+              <div class="bg-white p-8 rounded-3xl w-full max-w-sm text-center shadow-2xl animate-scale-in">
+                <i data-lucide="alert-triangle" class="text-red-600 mx-auto mb-4 w-12 h-12"></i>
+                <h2 class="text-[19px] font-bold leading-relaxed text-slate-900 mb-6 whitespace-pre-line">${esc(state.errorMsg)}</h2>
+                <button type="button" onclick="setState({errorMsg:null})" class="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold text-base">확인</button>
+              </div>
+            </div>`;
+        }
+
+        switch (state.step) {
+          case 0: {
+            const projects = Store.list();
+            content += `<div class="min-h-screen flex flex-col px-7 pt-14 pb-10 bg-dark-navy text-white relative overflow-hidden">
+                <div class="flex-1 flex flex-col justify-center gap-8 animate-fade-in">
+                  <div class="space-y-5">
+                    <div class="inline-block px-4 py-1.5 bg-blue-600 rounded-full text-[12px] font-black tracking-widest uppercase w-fit">Design Researcher AI</div>
+                    <h1 class="text-5xl font-black leading-tight tracking-tighter">사용자의<br/>진심을<br/><span class="text-blue-500">발견하세요.</span></h1>
+                    <p class="text-slate-400 text-lg leading-relaxed font-medium">디자인 리서치 전 과정을 AI가 돕습니다.<br/>주제 설정부터 인터뷰까지 단숨에 진행하세요.</p>
+                  </div>
+                  <button onclick="Actions.startNewProject()" class="w-full py-5 bg-white text-slate-900 rounded-2xl font-black text-xl shadow-2xl flex items-center justify-center gap-2 btn-active">
+                    새 프로젝트 시작 <i data-lucide="arrow-right" class="w-6 h-6"></i>
+                  </button>
+                  <div>
+                    <h2 class="text-[13px] font-black tracking-widest text-slate-400 mb-3">AI 모델 · Qwen3 (API 키 없이 기기에서 실행)</h2>
+                    ${"gpu" in navigator ? "" : `<p class="text-sm text-amber-300 bg-amber-400/10 border border-amber-300/30 rounded-2xl px-4 py-3 mb-3 leading-relaxed">이 브라우저는 WebGPU를 지원하지 않아 AI를 실행할 수 없습니다. 안드로이드 최신 크롬이나 PC 크롬·엣지에서 열어 주세요.</p>`}
+                    <div class="grid grid-cols-3 gap-2">
+                      ${Object.keys(MODELS).map(k => `<button type="button" onclick="Actions.setModel('${k}')" class="rounded-2xl px-2 py-3 border text-center btn-active ${state.modelSize === k ? 'bg-blue-600 border-blue-500 text-white' : 'bg-white/5 border-white/15 text-slate-300'}">
+                        <span class="block text-lg font-black">${MODELS[k].label}</span>
+                        <span class="block text-[12px] font-medium opacity-80">${MODELS[k].note}</span>
+                      </button>`).join("")}
+                    </div>
+                    <p class="text-[13px] text-slate-400 mt-2 leading-relaxed">${MODELS[state.modelSize].detail}. 처음 한 번 모델을 내려받으니 와이파이에서 시작하세요. ${engine && engineModelId && engineModelId.includes(state.modelSize + "-") ? `<span class="text-emerald-300 font-bold">· 준비 완료</span>` : `<button type="button" onclick="Actions.prepareModel()" class="text-sky-300 font-bold underline underline-offset-2">미리 준비하기</button>`}</p>
+                  </div>
+                  <div>
+                    <h2 class="text-[13px] font-black tracking-widest text-slate-400 mb-3">저장된 프로젝트 ${projects.length}/${MAX_PROJECTS}</h2>
+                    ${projects.length ? `<ul class="space-y-2">${projects.map(p => `
+                      <li class="flex items-center gap-2 bg-white/5 border border-white/10 rounded-2xl pl-4 pr-1.5 py-2.5">
+                        <button type="button" onclick="Actions.openProject('${esc(p.id)}')" class="flex-1 text-left min-w-0">
+                          <span class="block text-base font-bold text-white truncate">${esc(p.title)}</span>
+                          <span class="block text-[13px] text-slate-400">${esc(new Date(p.savedAt).toLocaleString("ko-KR"))}</span>
+                        </button>
+                        <button type="button" aria-label="${esc(p.title)} 삭제" onclick="Actions.deleteProject('${esc(p.id)}')" class="p-2.5 rounded-full hover:bg-white/10 text-slate-400 shrink-0"><i data-lucide="trash-2" class="w-5 h-5"></i></button>
+                      </li>`).join("")}</ul>`
+                    : `<p class="text-sm text-slate-400 bg-white/5 border border-white/10 rounded-2xl px-4 py-4 leading-relaxed">아직 저장된 프로젝트가 없습니다. 새 프로젝트를 시작하면 진행 상태가 자동으로 저장됩니다.</p>`}
+                  </div>
+                </div>
+              </div>`;
+            break;
+          }
+
+          case 1:
+            content += `<div class="pt-[100px] px-5 dock-space min-h-screen flex flex-col animate-fade-in bg-white">
+                ${renderHeader("주제 설정", 0)}
+                <div class="mb-6">
+                  <h2 class="text-3xl font-black mb-2 tracking-tight leading-tight text-slate-900">어떤 주제로<br/>사용자 리서치를 진행할까요?</h2>
+                  <p class="text-slate-400 font-medium text-sm">탐색하고 싶은 과제를 구체적으로 입력해 주세요.</p>
+                </div>
+                <textarea id="topic-input" class="w-full h-60 p-5 bg-slate-50 border border-slate-100 rounded-[2rem] text-xl outline-none placeholder:text-slate-300 font-medium leading-relaxed" placeholder="예: 해외 여행을 계획할 때 스트레스를 느끼는 1인 가구">${state.researchTopic}</textarea>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="const val = document.getElementById('topic-input').value; if(val){ setState({researchTopic: val}); Actions.generatePersonas(); }" class="w-full py-5 bg-slate-900 text-white rounded-2xl font-black text-lg shadow-lg btn-active">인터뷰 타겟 제안 받기</button>
+                </div>
+              </div>`;
+            break;
+
+          case 2:
+            content += `<div class="pt-[100px] px-5 dock-space animate-fade-in bg-white">
+                ${renderHeader("타겟 제안", 1)}
+                <h2 class="text-3xl font-black mb-2 tracking-tight text-slate-900">이런 분들은 어떠신가요?</h2>
+                <p class="text-blue-600 text-lg font-bold mb-4">리서치 전문가가 분석한 최적의 타겟 10명입니다.</p>
+                <div class="space-y-0 mb-6">
+                  ${[...state.aiPersonas, ...state.manualPersonas].map((p, i) => `
+                    <div class="py-7 border-b border-slate-100 animate-fade-in last:border-0">
+                      <h3 class="font-black text-[22px] text-slate-900 mb-3 leading-snug">${i+1}. ${p.name}</h3>
+                      <p class="text-[17px] text-slate-700 font-medium mb-4 leading-relaxed whitespace-pre-line">${p.description}</p>
+                      <div class="w-full bg-quote-gray px-5 py-4 rounded-2xl text-[17px] text-slate-600 font-medium italic border border-slate-200/40">
+                        <span class="font-black text-slate-900 not-italic">- 주요니즈:</span> " ${p.needs} "
+                      </div>
+                    </div>`).join('')}
+                </div>
+                <div class="space-y-3">
+                  <div class="p-4 bg-blue-50/50 border border-blue-100 rounded-3xl space-y-2.5">
+                    <h4 class="text-sm font-black text-blue-600 uppercase tracking-widest flex items-center gap-2">
+                      <i data-lucide="sparkles" class="w-4 h-4"></i> 타겟 수정 지시
+                    </h4>
+                    <div class="flex items-center gap-2">
+                      <input type="text" id="persona-inst" onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.generatePersonas(document.getElementById('persona-inst').value);}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 소득 수준 낮은 학생 위주">
+                      <button onclick="Actions.generatePersonas(document.getElementById('persona-inst').value)" aria-label="보내기" class="shrink-0 w-12 h-12 bg-blue-600 text-white rounded-2xl shadow-md flex items-center justify-center btn-active">
+                        <i data-lucide="send" class="w-5 h-5"></i>
+                      </button>
+                    </div>
+                  </div>
+                  <div class="p-4 bg-slate-50 border border-slate-200/50 rounded-3xl space-y-2.5">
+                    <h4 class="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><i data-lucide="plus" class="w-4 h-4"></i> 직접 타겟 추가</h4>
+                    <input type="text" id="manual-p-name" class="w-full h-12 px-4 bg-white border border-slate-200 rounded-2xl text-base font-bold outline-none" placeholder="이름 또는 제목">
+                    <textarea id="manual-p-desc" class="w-full p-4 bg-white border border-slate-200 rounded-2xl text-base h-28 outline-none resize-none" placeholder="배경 및 니즈 정보"></textarea>
+                    <button onclick="Actions.addManualPersona()" class="w-full py-3.5 bg-dark-navy text-white rounded-2xl font-black text-lg btn-active">리스트에 추가</button>
+                  </div>
+                </div>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="setState({step: 3})" class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg shadow-lg btn-active">인터뷰 대상 선택</button>
+                </div>
+              </div>`;
+            break;
+
+          case 3:
+            const selectable = [...state.aiPersonas, ...state.manualPersonas];
+            content += `<div class="pt-[100px] px-5 dock-space animate-fade-in bg-white">
+                ${renderHeader("타겟 선택", 2)}
+                <h2 class="text-3xl font-black mb-5 tracking-tight text-slate-900">인터뷰를 진행할<br/>핵심 타겟을 골라주세요</h2>
+                <div class="grid gap-3">
+                  ${selectable.map((p, i) => {
+                    const isDone = state.history.some(h => h.personaId === p.id);
+                    const isSel = state.selectedPersonaId === p.id;
+                    return `<div onclick="${isDone ? '' : `setState({selectedPersonaId: '${p.id}', aiSurveys: [], manualSurveys: [], selectedQuestionIds: []})`}" class="p-5 rounded-[2rem] border-2 transition-all cursor-pointer ${isDone ? 'opacity-40 bg-slate-50 border-slate-100' : (isSel ? 'border-blue-600 bg-blue-50 shadow-lg' : 'border-slate-100 bg-white hover:border-slate-200 shadow-sm')}">
+                      <div class="flex items-center gap-3 mb-2">
+                        <div class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${isSel ? 'bg-blue-600 text-white shadow-lg' : 'bg-slate-100 text-slate-400'} font-black text-lg">${i + 1}</div>
+                        <h3 class="font-black text-xl text-slate-900">${p.name} ${isDone ? '(완료)' : ''}</h3>
+                      </div>
+                      <p class="text-base text-slate-600 leading-relaxed font-medium whitespace-pre-line">${p.description}</p>
+                    </div>`;
+                  }).join('')}
+                </div>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="Actions.generateSurveys()" ${!state.selectedPersonaId ? 'disabled' : ''} class="w-full py-5 bg-slate-900 text-white rounded-2xl font-black text-lg btn-active shadow-lg disabled:opacity-30">인터뷰 질문 제안 받기</button>
+                </div>
+              </div>`;
+            break;
+
+          case 4:
+            const combinedSurveys = [...state.aiSurveys, ...state.manualSurveys];
+            content += `<div class="pt-[100px] px-5 dock-space animate-fade-in bg-white">
+                ${renderHeader("질문 설계", 3)}
+                <h2 class="text-3xl font-black mb-2 tracking-tight text-slate-900">인터뷰 질문 설계</h2>
+                <p class="text-blue-600 text-lg font-bold mb-6">제안된 ${MAX_QUESTIONS}개 질문이 모두 선택되어 있습니다. 빼거나 직접 추가해 구성하세요 (최대 ${MAX_QUESTIONS}개).</p>
+                <div class="space-y-8 mb-6">
+                  ${combinedSurveys.map(s => `
+                    <div>
+                      <h3 class="font-black text-xl text-slate-900 mb-3 flex items-center gap-3"><div class="w-2.5 h-6 bg-blue-600 rounded-full"></div> ${s.title}</h3>
+                      <div class="space-y-2.5">
+                        ${s.questions.map((q, idx) => {
+                          const qId = `${s.id}-${idx}`; 
+                          const isSel = state.selectedQuestionIds.includes(qId);
+                          return `<div onclick="toggleQuestion('${qId}')" class="p-4 rounded-[1.25rem] border-2 transition-all cursor-pointer flex gap-3 ${isSel ? 'border-blue-600 bg-blue-50 shadow-md' : 'border-slate-100 bg-white shadow-sm'}">
+                            <div class="w-6 h-6 rounded-full border-2 flex items-center justify-center shrink-0 mt-0.5 ${isSel ? 'border-blue-600 bg-blue-600' : 'border-slate-200'} text-white">${isSel ? `<i data-lucide="check" class="w-4 h-4"></i>` : ""}</div>
+                            <p class="text-base text-slate-800 font-bold flex-1">${q}</p>
+                          </div>`;
+                        }).join('')}
+                      </div>
+                    </div>`).join('')}
+                </div>
+                <div class="p-4 bg-slate-50 border border-slate-200/50 rounded-3xl space-y-2.5">
+                  <h4 class="text-sm font-black text-slate-500 uppercase tracking-widest flex items-center gap-2"><i data-lucide="plus" class="w-4 h-4"></i> 직접 질문 추가</h4>
+                  <textarea id="manual-q-input" class="w-full p-4 bg-white border border-slate-200 rounded-2xl text-base h-28 outline-none resize-none font-medium" placeholder="엔터로 구분하여 질문을 입력하세요"></textarea>
+                  <button onclick="Actions.addManualQuestions()" class="w-full py-3.5 bg-dark-navy text-white rounded-2xl font-black text-lg btn-active">질문에 추가</button>
+                </div>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
+                  <button onclick="if(state.selectedQuestionIds.length > 0) setState({step: 5})" ${state.selectedQuestionIds.length === 0 ? 'disabled' : ''} class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg shadow-lg disabled:opacity-30 btn-active">선택 완료 (${state.selectedQuestionIds.length}/${MAX_QUESTIONS})</button>
+                </div>
+              </div>`;
+            break;
+
+          case 5:
+            const finalQList = [];
+            [...state.aiSurveys, ...state.manualSurveys].forEach(s => s.questions.forEach((q, i) => { if(state.selectedQuestionIds.includes(`${s.id}-${i}`)) finalQList.push(q); }));
+            const selectedP = [...state.aiPersonas, ...state.manualPersonas].find(p=>p.id===state.selectedPersonaId);
+            content += `<div class="pt-[100px] px-5 dock-space animate-fade-in bg-white">
+                ${renderHeader("인터뷰 확정", 4)}
+                <h2 class="text-3xl font-black mb-5 tracking-tight text-slate-900">최종 확인</h2>
+                <div class="bg-dark-navy p-6 rounded-[2rem] text-white shadow-xl">
+                  <div class="mb-5 border-b border-white/10 pb-4"><h3 class="font-black text-2xl leading-tight">${selectedP?.name}</h3></div>
+                  <div class="space-y-3 max-h-[50vh] overflow-y-auto pr-2 no-scrollbar font-medium">
+                    ${finalQList.map((q, i) => `<div class="flex gap-4 text-base text-slate-300"><span class="font-bold text-blue-400 shrink-0">${i+1}.</span> <p>${q}</p></div>`).join('')}
+                  </div>
+                </div>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]"><button onclick="Actions.performInterview()" class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg btn-active shadow-lg">가상 인터뷰 진행하기</button></div>
+              </div>`;
+            break;
+
+          case 6:
+            const curH = state.history[state.history.length-1];
+            const curPersona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId);
+            content += `<div class="pt-[100px] px-5 dock-space-2 animate-fade-in bg-white">
+                ${renderHeader("인터뷰 결과", 3)}
+                <div class="mb-5 p-6 bg-dark-navy rounded-[2rem] text-white shadow-xl">
+                    <h2 class="text-2xl font-black mb-3 leading-tight">${curPersona.name}님 리포트</h2>
+                    <p class="text-slate-300 text-lg leading-relaxed whitespace-pre-line font-medium">${curH.result.summary}</p>
+                </div>
+                <div class="space-y-3 mb-5">
+                  ${curH.result.qaPairs.map((qa, i) => `
+                    <div class="bg-white p-5 rounded-[1.5rem] border border-slate-100 shadow-sm animate-fade-in">
+                      <div class="text-blue-600 font-black text-[11px] uppercase mb-2 tracking-widest flex items-center gap-2">Question</div>
+                      <div class="text-slate-900 font-bold text-lg mb-4 leading-relaxed">${i+1}. ${qa.q}</div>
+                      <div class="text-slate-400 font-black text-[11px] uppercase mb-2 tracking-widest flex items-center gap-2">Answer</div>
+                      <div class="text-slate-700 font-medium text-lg leading-relaxed">${qa.a}</div>
+                    </div>`).join('')}
+                </div>
+                <div class="p-4 bg-blue-50/50 border border-blue-100 rounded-3xl space-y-2.5 mb-5">
+                    <h4 class="text-sm font-black text-blue-600 uppercase tracking-widest flex items-center gap-2">
+                      <i data-lucide="sparkles" class="w-4 h-4"></i> 인터뷰 추가 질문
+                    </h4>
+                    <div class="flex items-center gap-2">
+                      <input type="text" id="followup-input" onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.askFollowUp();}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 3번 대답의 000에 대해 자세한 설명">
+                      <button onclick="Actions.askFollowUp()" aria-label="보내기" class="shrink-0 w-12 h-12 bg-blue-600 text-white rounded-2xl shadow-md flex items-center justify-center btn-active">
+                        <i data-lucide="send" class="w-5 h-5"></i>
+                      </button>
+                    </div>
+                  </div>
+                <div class="p-6 bg-blue-50 border border-blue-100 rounded-[2rem] shadow-inner">
+                  <h3 class="text-blue-600 font-black text-sm uppercase tracking-widest mb-3 flex items-center gap-2"><i data-lucide="lightbulb" class="w-5 h-5"></i> Key Insights</h3>
+                  <div class="text-slate-800 font-bold text-lg leading-relaxed whitespace-pre-line">${curH.result.keyInsights}</div>
+                </div>
+                <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60] space-y-2">
+                  <button onclick="setState({step: 3})" class="w-full py-4 bg-white border-2 border-blue-600 text-blue-600 rounded-2xl font-black text-lg flex items-center justify-center gap-2 btn-active">
+                    <i data-lucide="rotate-ccw" class="w-5 h-5"></i> 다른 타겟 인터뷰하기
+                  </button>
+                  <button onclick="copyReportToClipboard()" class="w-full py-4 bg-slate-900 text-white rounded-2xl font-black text-lg shadow-lg btn-active">리포트 복사 및 인터뷰 종료</button>
+                </div>
+              </div>`;
+            break;
+        }
+        
+        root.innerHTML = `<div class="w-full max-w-[430px] mx-auto min-h-screen shadow-2xl relative overflow-hidden">${content}</div>`;
+        lucide.createIcons();
+      }
+
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        if (state.errorMsg) setState({ errorMsg: null });
+        else if (state.isAnalyzing) Actions.cancel();
+      });
+
+      // --- BOOTSTRAP ---
+      // 5초 간격 자동 저장 (내용이 바뀐 경우에만) + 창을 닫을 때 저장
+      setInterval(() => { try { persist(false); } catch (e) { console.warn("자동 저장 실패", e); } }, AUTOSAVE_MS);
+      window.addEventListener("beforeunload", () => { try { persist(false); } catch (e) { /* 무시 */ } });
+      document.addEventListener("visibilitychange", () => { if (document.hidden) { try { persist(false); } catch (e) { /* 무시 */ } } });
+
+      /* 당겨서 새로고침 막기 (CSS overscroll-behavior를 무시하는 브라우저용 보조 장치)
+         화면 맨 위에서 아래로 끌어내릴 때만 막고, 안쪽 스크롤 목록·입력창 스크롤은 그대로 둠 */
+      (function blockPullToRefresh() {
+        let startY = 0;
+        document.addEventListener("touchstart", (e) => {
+          if (e.touches.length === 1) startY = e.touches[0].clientY;
+        }, { passive: true });
+        document.addEventListener("touchmove", (e) => {
+          if (e.touches.length !== 1) return;
+          const pullingDown = e.touches[0].clientY - startY > 0;
+          if (!pullingDown) return;
+          const pageTop = (window.scrollY || document.documentElement.scrollTop || 0) <= 0;
+          if (!pageTop) return;
+          // 손가락 아래에 위로 더 스크롤할 수 있는 영역이 있으면 그 영역의 스크롤은 허용
+          for (let el = e.target; el && el !== document.body; el = el.parentElement) {
+            if (el.scrollTop > 0) return;
+          }
+          if (e.cancelable) e.preventDefault();
+        }, { passive: false });
+      })();
+
+      if (document.readyState === "complete") render();
+      else window.addEventListener("load", render);
+
+    })();
+  </script>
+</body>
+</html>
