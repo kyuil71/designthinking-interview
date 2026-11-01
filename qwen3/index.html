@@ -71,7 +71,10 @@
     (async function() {
       // --- CONFIG & CONSTANTS ---
       // API 키 없이 브라우저 안에서 Qwen3를 직접 실행 (WebLLM · WebGPU)
-      const WEBLLM_URL = "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.86/+esm";
+      // 0.2.82 고정: 0.2.83부터 들어간 GPU 버퍼 재사용 방식이 일부 휴대폰(삼성 인터넷 등)에서
+      // "mapAsync … Buffer was unmapped" 오류를 내므로, 매번 새 버퍼를 쓰는 마지막 버전을 사용
+      const WEBLLM_URL = "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.82/+esm";
+      const F32_PREF_KEY = "research_lab_qwen3_force_f32";   // GPU 오류가 반복된 기기는 호환성 높은 f32 모델로 전환
       const MODELS = {
         "0.6B": { label: "0.6B", note: "빠름 · 약 0.4GB", detail: "가장 빠르지만 답변이 단순합니다" },
         "1.7B": { label: "1.7B", note: "기본 · 약 1.1GB", detail: "휴대폰 권장 — 속도와 품질의 균형" },
@@ -302,8 +305,18 @@ JSON 형식: {"surveys":[{"title":"그룹 제목","questions":["질문1","질문
         catch (e) { return false; }
       }
 
+      function forceF32() { try { return localStorage.getItem(F32_PREF_KEY) === "1"; } catch (e) { return false; } }
       async function modelIdFor(size) {
-        return `Qwen3-${size}-${(await supportsF16()) ? "q4f16_1" : "q4f32_1"}-MLC`;
+        const f16 = !forceF32() && (await supportsF16());
+        return `Qwen3-${size}-${f16 ? "q4f16_1" : "q4f32_1"}-MLC`;
+      }
+
+      // 그래픽 칩(WebGPU) 쪽에서 난 오류인지 판별 — 이런 오류는 엔진을 새로 만들면 대개 복구됨
+      const isGpuError = (e) => /mapAsync|GPUBuffer|GPUDevice|WebGPU|device (was )?lost|Device lost|unmapped|out of memory|OOM/i.test(String((e && e.message) || e));
+      async function resetEngine() {
+        const old = engine;
+        engine = null; engineModelId = null;
+        try { if (old) await old.unload(); } catch (e) { /* 무시 */ }
       }
 
       async function ensureEngine() {
@@ -353,7 +366,27 @@ JSON 형식: {"surveys":[{"title":"그룹 제목","questions":["질문1","질문
         .trim();
 
       // 한 번의 AI 호출. schema를 주면 그 형식의 JSON만 나오도록 강제 (작은 모델의 형식 깨짐 방지)
-      async function llm(system, user, { schema = null, maxTokens = 600, temperature = 0.7, onText = null } = {}) {
+      async function llm(system, user, opts = {}) {
+        const my = runId;
+        for (let attempt = 0; ; attempt++) {
+          try {
+            return await llmOnce(system, user, opts);
+          } catch (e) {
+            if ((e && e.aborted) || my !== runId || !isGpuError(e)) throw e;
+            console.warn("GPU 오류 — 엔진을 다시 만들어 재시도합니다", attempt + 1, e);
+            if (attempt >= 2) {
+              throw new Error("휴대폰의 그래픽 처리(WebGPU)에서 오류가 반복되었습니다.\n크롬 브라우저로 열거나, 홈 화면에서 더 작은 모델(0.6B)을 골라 다시 시도해 주세요.");
+            }
+            // 1차: 같은 모델로 엔진만 새로 만듦 / 2차: 호환성이 높은 f32 모델로 전환
+            if (attempt === 1) { try { localStorage.setItem(F32_PREF_KEY, "1"); } catch (x) { /* 무시 */ } }
+            setProgress({ detail: attempt === 0 ? "그래픽 오류가 나서 AI를 다시 준비하고 있습니다" : "호환 모드로 AI를 다시 준비하고 있습니다", preview: "" });
+            await resetEngine();
+            checkCancel(my);
+          }
+        }
+      }
+
+      async function llmOnce(system, user, { schema = null, maxTokens = 600, temperature = 0.7, onText = null } = {}) {
         const my = runId;
         await ensureEngine();
         checkCancel(my);
