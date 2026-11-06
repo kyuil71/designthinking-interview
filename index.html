@@ -215,7 +215,6 @@
         isAnalyzing: false,
         loadingMsg: "",
         errorMsg: null,
-        live: null,
         ...blankProject(),
         maxStepReached: -1
       };
@@ -242,7 +241,7 @@
       let quotaWarned = false;
 
       function snapshotOf(s) {
-        const { apiKey, isAnalyzing, loadingMsg, errorMsg, live, ...data } = s;
+        const { apiKey, isAnalyzing, loadingMsg, errorMsg, ...data } = s;
         return data;
       }
       function projectTitle() {
@@ -298,28 +297,9 @@
         throw new Error("AI 응답을 JSON으로 해석하지 못했습니다. 다시 시도해 주세요.");
       }
 
-      // 응답 JSON이 다 오기 전에, 배열 안에서 이미 완성된 항목만 골라냄 (나오는 대로 보여 주기)
-      function extractArrayItems(text, key) {
-        const k = text.indexOf(`"${key}"`);
-        if (k < 0) return [];
-        const start = text.indexOf("[", k);
-        if (start < 0) return [];
-        const out = [];
-        let depth = 0, inStr = false, escNext = false, objStart = -1;
-        for (let i = start + 1; i < text.length; i++) {
-          const c = text[i];
-          if (inStr) { if (escNext) escNext = false; else if (c === "\\") escNext = true; else if (c === '"') inStr = false; continue; }
-          if (c === '"') { inStr = true; continue; }
-          if (c === "{") { if (depth === 0) objStart = i; depth++; }
-          else if (c === "}") { depth--; if (depth === 0 && objStart >= 0) { try { out.push(JSON.parse(text.slice(objStart, i + 1))); } catch (e) { /* 무시 */ } objStart = -1; } }
-          else if (c === "]" && depth === 0) break;
-        }
-        return out;
-      }
-
       let thinkingUnsupported = false;   // 생각 수준 설정을 받지 않는 모델이면 설정 없이 재요청
 
-      // 스트리밍으로 받으면서 onText(지금까지 받은 글)로 알려 줌. 생각 수준은 medium으로 고정.
+      // 스트리밍으로 받아 끝까지 모은 뒤 한 번에 돌려줌. 생각 수준은 medium으로 고정.
       async function callGemini(systemPrompt, userPrompt, temperature = 0.1, { signal = null, onText = null } = {}) {
         let controller = null;
         if (!signal) { controller = new AbortController(); activeController = controller; signal = controller.signal; }
@@ -419,7 +399,6 @@
       let personaJob = null;
       let surveyJob = null;
       let prefetchJob = null;
-      const jobs = {};
 
       // 선택한 질문을 질문 묶음(카테고리)별로 나눔 — 묶음마다 동시에 요청
       function interviewPlan() {
@@ -438,76 +417,37 @@
 
       function jobResult(job) {
         return {
-          summary: job.summary,
-          qaPairs: job.qa.map(x => ({ q: x.q, a: x.a })),
-          keyInsights: job.keyInsights
+          summary: job.summary || "",
+          qaPairs: job.qa.map(x => ({ q: x.q, a: x.a || "" })),
+          keyInsights: job.keyInsights || ""
         };
       }
 
-      // 인터뷰 기록 중 이 작업에 연결된 항목을 최신 내용으로 갱신
-      function syncJob(job) {
-        if (!job.attached) return;
-        const i = state.history.findIndex(h => h.jobId === job.id);
-        if (i < 0) return;
-        const h = [...state.history];
-        h[i] = { ...h[i], result: jobResult(job), pending: !job.done };
-        setState({ history: h });
-      }
-
-      function finishAttached(job) {
-        const i = state.history.findIndex(h => h.jobId === job.id);
-        if (i < 0) return;
-        const h = [...state.history];
-        const { jobId, pending, ...rest } = h[i];
-        const result = jobResult(job);
-        result.qaPairs = result.qaPairs.map(x => ({ q: x.q, a: x.a || (job.stopped ? "(답변 생성을 중지했습니다)" : "(답변을 받지 못했습니다)") }));
-        if (!result.summary) result.summary = job.stopped ? "(인터뷰를 중지해 요약을 만들지 않았습니다)" : "(요약을 받지 못했습니다)";
-        if (!result.keyInsights) result.keyInsights = "";
-        h[i] = { ...rest, result };
-        setState({ history: h });
-        delete jobs[job.id];
-        if (job.error && !job.stopped) setState({ errorMsg: (job.error.message || "인터뷰 생성에 실패했습니다.") + "\n(받은 답변까지는 남겨 두었습니다)" });
-        else if (job.stopped) showToast("인터뷰를 중지했습니다.");
-        else { const t = job.pressedAt ? (performance.now() - job.pressedAt) / 1000 : 0; showToast(t < 0.5 ? "인터뷰 완료 · 미리 준비됨" : `인터뷰 완료 · ${t.toFixed(1)}초`); }
-      }
-
+      // 질문 묶음별로 동시에 답변을 받고, 다 모이면 요약·인사이트를 정리 (화면에는 끝난 뒤 한 번에 표시)
       function startInterviewJob(plan) {
         const controller = new AbortController();
-        const job = { id: uid(), key: plan.key, controller, attached: false, done: false, error: null, stopped: false,
+        const job = { key: plan.key, controller, done: false, error: null, stopped: false,
           qa: plan.questions.map(q => ({ q, a: null })), summary: null, keyInsights: null };
-        jobs[job.id] = job;
         controller.signal.addEventListener("abort", () => { job.stopped = true; });
-        (async () => {
+        job.finished = (async () => {
           try {
             let offset = 0;
-            const parts = plan.groups.map(g => {
+            await Promise.all(plan.groups.map(g => {
               const start = offset; offset += g.length;
-              let shown = 0;
-              return callGemini(PROMPTS.GENERATE_INTERVIEW_PART(plan.topic, plan.persona, g), "Start interview.", 0.1, {
-                signal: controller.signal,
-                onText: (t) => {
-                  const items = extractArrayItems(t, "answers");
-                  if (items.length <= shown) return;
-                  for (let k = shown; k < items.length && k < g.length; k++) job.qa[start + k].a = String(items[k].a || "").replace(/\*\*/g, "").trim() || null;
-                  shown = items.length;
-                  syncJob(job);
-                }
-              }).then(r => {
-                const items = r && Array.isArray(r.answers) ? r.answers : [];
-                for (let k = 0; k < g.length; k++) if (!job.qa[start + k].a && items[k]) job.qa[start + k].a = String(items[k].a || "").replace(/\*\*/g, "").trim() || null;
-                syncJob(job);
-              });
-            });
-            await Promise.all(parts);
-            const done = job.qa.filter(x => x.a);
-            const s = await callGemini(PROMPTS.GENERATE_SUMMARY(plan.topic, plan.persona, done), "Summarize the interview.", 0.1, { signal: controller.signal });
-            job.summary = String((s && s.summary) || "").replace(/\*\*/g, "").trim() || null;
-            job.keyInsights = String((s && s.keyInsights) || "").replace(/\*\*/g, "").trim() || null;
+              return callGemini(PROMPTS.GENERATE_INTERVIEW_PART(plan.topic, plan.persona, g), "Start interview.", 0.1, { signal: controller.signal })
+                .then(r => {
+                  const items = r && Array.isArray(r.answers) ? r.answers : [];
+                  for (let k = 0; k < g.length; k++) job.qa[start + k].a = items[k] ? String(items[k].a || "").replace(/\*\*/g, "").trim() : "";
+                });
+            }));
+            if (job.qa.some(x => !x.a)) throw new Error("일부 질문의 답변을 받지 못했습니다. 다시 시도해 주세요.");
+            const s = await callGemini(PROMPTS.GENERATE_SUMMARY(plan.topic, plan.persona, job.qa), "Summarize the interview.", 0.1, { signal: controller.signal });
+            job.summary = String((s && s.summary) || "").replace(/\*\*/g, "").trim();
+            job.keyInsights = String((s && s.keyInsights) || "").replace(/\*\*/g, "").trim();
           } catch (e) {
             if (!(e && e.aborted)) { job.error = e; controller.abort(); job.stopped = false; }
           } finally {
             job.done = true;
-            if (job.attached) finishAttached(job);
           }
         })();
         return job;
@@ -568,12 +508,6 @@
           render();
         },
 
-        stopLive() {
-          if (personaJob) { personaJob.controller.abort(); }
-          const h = state.history[state.history.length - 1];
-          if (h && h.pending && h.jobId && jobs[h.jobId]) jobs[h.jobId].controller.abort();
-        },
-
         goHome() {
           if (state.isAnalyzing) return;
           persist(true);
@@ -610,35 +544,21 @@
             const id = same ? same.id : uid(); used.add(id);
             return { id, name, description, needs: String(p.needs || "").replace(/\*\*/g, "").trim() };
           };
-          const list = [];
-          const pushNew = (items) => {
-            if (items.length <= list.length) return;
-            const first = list.length === 0;
-            for (let i = list.length; i < items.length; i++) list.push(toPersona(items[i], i));
-            // 첫 인물이 나오면 바로 목록 화면으로 넘어가 나오는 대로 보여 줌 (이후에는 화면을 옮기지 않음)
-            setState({ isAnalyzing: false, aiPersonas: [...list], ...(first ? { step: 2 } : {}), live: { kind: "personas", done: list.length, total: 10 } });
-          };
           let res = null, failed = null;
           try {
-            res = await callGemini(system, userPrompt, 0.7, { signal: controller.signal, onText: (t) => pushNew(extractArrayItems(t, "personas")) });
+            res = await callGemini(system, userPrompt, 0.7, { signal: controller.signal });
           } catch (e) { failed = e; }
           personaJob = null; activeController = null;
           if (failed) {
-            if (failed.aborted) {
-              setState({ isAnalyzing: false, live: null });
-              showToast(list.length ? `중지했습니다 (${list.length}명까지 받음)` : "분석을 취소했습니다.");
-            } else {
-              console.error(failed);
-              setState({ isAnalyzing: false, live: null, errorMsg: (failed.message || "분석에 실패했습니다.") + (list.length ? `\n(${list.length}명까지 받은 결과는 남겨 두었습니다)` : "") });
-            }
+            if (failed.aborted) { setState({ isAnalyzing: false }); showToast("분석을 취소했습니다."); }
+            else { console.error(failed); setState({ isAnalyzing: false, errorMsg: failed.message || "분석에 실패했습니다." }); }
             return;
           }
-          const finalItems = res && Array.isArray(res.personas) ? res.personas : [];
-          if (finalItems.length > list.length) pushNew(finalItems);
-          if (!list.length) { setState({ isAnalyzing: false, live: null, errorMsg: "타겟 제안을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+          const list = (res && Array.isArray(res.personas) ? res.personas : []).map(toPersona);
+          if (!list.length) { setState({ isAnalyzing: false, errorMsg: "타겟 제안을 받지 못했습니다. 다시 시도해 주세요." }); return; }
           const keepSel = list.some(p => p.id === state.selectedPersonaId);
-          setState({ isAnalyzing: false, live: null, aiPersonas: [...list], ...(keepSel ? {} : { selectedPersonaId: null, aiSurveys: [], manualSurveys: [], selectedQuestionIds: [] }) });
-          const b2 = document.getElementById('persona-inst'); if (b2) b2.value = instruction ? "" : instText;
+          setState({ isAnalyzing: false, aiPersonas: list, step: 2, ...(keepSel ? {} : { selectedPersonaId: null, aiSurveys: [], manualSurveys: [], selectedQuestionIds: [] }) });
+          const b2 = document.getElementById('persona-inst'); if (b2 && !instruction) b2.value = instText;
           showToast(`타겟 제안 완료 · ${secs(t0)}초`);
         },
 
@@ -717,24 +637,33 @@
           const plan = interviewPlan();
           if (!plan) return;
           if (prefetchJob && prefetchJob.key === plan.key && !prefetchJob.error && !prefetchJob.stopped) return;
-          if (prefetchJob && !prefetchJob.attached && !prefetchJob.done) prefetchJob.controller.abort();
+          if (prefetchJob && !prefetchJob.done) prefetchJob.controller.abort();
           prefetchJob = startInterviewJob(plan);
         },
 
-        performInterview() {
+        async performInterview() {
           const plan = interviewPlan();
           if (!plan) { showToast("질문을 선택해 주세요."); return; }
+          const t0 = performance.now();
           let job = prefetchJob;
-          if (!(job && job.key === plan.key && !job.attached && !job.error && !job.stopped)) {
-            if (job && !job.attached && !job.done) job.controller.abort();
+          if (!(job && job.key === plan.key && !job.error && !job.stopped)) {
+            if (job && !job.done) job.controller.abort();
             job = startInterviewJob(plan);
           }
           prefetchJob = null;
-          job.attached = true;
-          job.pressedAt = performance.now();
-          const entry = { personaId: plan.persona.id, persona: { name: plan.persona.name, description: plan.persona.description, needs: plan.persona.needs }, jobId: job.id, pending: !job.done, result: jobResult(job) };
+          const wasReady = job.done;
+          // 답변·요약·인사이트가 모두 끝난 뒤 한 번에 보여 줌
+          const result = await withLoading(`선택한 타겟과 ${plan.questions.length}개 질문으로\n가상 인터뷰를 진행하고 있습니다`, async () => {
+            activeController = job.controller;
+            await job.finished;
+            if (job.stopped && !job.error) { const e = new Error("__aborted__"); e.aborted = true; throw e; }
+            if (job.error) throw job.error;
+            return jobResult(job);
+          });
+          if (!result) return;
+          const entry = { personaId: plan.persona.id, persona: { name: plan.persona.name, description: plan.persona.description, needs: plan.persona.needs }, result };
           setState({ history: [...state.history, entry], step: 6 });
-          if (job.done) finishAttached(job);
+          showToast(wasReady ? "인터뷰 완료 · 미리 준비됨" : `인터뷰 완료 · ${secs(t0)}초`);
         },
 
         async askFollowUp() {
@@ -743,7 +672,6 @@
           const curH = state.history[state.history.length - 1];
           const persona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId) || curH.persona;
           if (!persona) { showToast("인터뷰 대상 정보를 찾을 수 없습니다."); return; }
-          if (curH.pending) { showToast("인터뷰가 끝난 뒤 추가 질문을 할 수 있습니다."); return; }
           const res = await withLoading("추가 질문에 대한 답변을 작성하는 중",
             () => callGemini(PROMPTS.GENERATE_FOLLOW_UP(state.researchTopic, persona, question), "Ask follow-up."));
           if (res) { const newH = [...state.history]; newH[newH.length-1].result.qaPairs.push(res); setState({ history: newH }); input.value = ""; }
@@ -825,15 +753,6 @@
               <span class="text-[13px] font-bold text-slate-500 tabular-nums shrink-0">${cur.n} / ${STAGES.length} · ${esc(cur.label)}</span>
             </div>` : ""}
           </header>`;
-      }
-
-      // 나오는 대로 보여 줄 때 상단에 붙는 진행 표시줄 (중지 가능)
-      function liveBar(label, done, total) {
-        return `<div class="sticky top-[86px] z-40 -mx-5 px-5 py-2.5 mb-3 bg-blue-600 text-white flex items-center gap-3 shadow-md">
-            <div class="w-5 h-5 border-2 border-white/40 border-t-white rounded-full animate-spin shrink-0"></div>
-            <span class="flex-1 text-[15px] font-bold">${label} <span class="tabular-nums">${done}/${total}</span></span>
-            <button type="button" onclick="Actions.stopLive()" class="px-3 py-1.5 rounded-xl bg-white/20 text-sm font-bold btn-active">중지</button>
-          </div>`;
       }
 
       function render() {
@@ -925,7 +844,6 @@
           case 2:
             content += `<div class="pt-[100px] px-5 dock-space animate-fade-in bg-white">
                 ${renderHeader("타겟 제안", 1)}
-                ${state.live && state.live.kind === "personas" ? liveBar("타겟 작성 중", state.aiPersonas.length, 10) : ""}
                 <h2 class="text-3xl font-black mb-2 tracking-tight text-slate-900">이런 분들은 어떠신가요?</h2>
                 <p class="text-blue-600 text-lg font-bold mb-4">리서치 전문가가 분석한 최적의 타겟 10명입니다.</p>
                 <div class="space-y-0 mb-6">
@@ -944,8 +862,8 @@
                       <i data-lucide="sparkles" class="w-4 h-4"></i> 타겟 수정 지시
                     </h4>
                     <div class="flex items-center gap-2">
-                      <input type="text" id="persona-inst" ${state.live ? "disabled" : ""} onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.generatePersonas(document.getElementById('persona-inst').value);}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 소득 수준 낮은 학생 위주">
-                      <button ${state.live ? "disabled" : ""} onclick="Actions.generatePersonas(document.getElementById('persona-inst').value)" aria-label="보내기" class="disabled:opacity-40 shrink-0 w-12 h-12 bg-blue-600 text-white rounded-2xl shadow-md flex items-center justify-center btn-active">
+                      <input type="text" id="persona-inst" onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.generatePersonas(document.getElementById('persona-inst').value);}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 소득 수준 낮은 학생 위주">
+                      <button onclick="Actions.generatePersonas(document.getElementById('persona-inst').value)" aria-label="보내기" class="shrink-0 w-12 h-12 bg-blue-600 text-white rounded-2xl shadow-md flex items-center justify-center btn-active">
                         <i data-lucide="send" class="w-5 h-5"></i>
                       </button>
                     </div>
@@ -958,7 +876,7 @@
                   </div>
                 </div>
                 <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60]">
-                  <button ${state.live ? "disabled" : ""} onclick="setState({step: 3})" class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg shadow-lg btn-active disabled:opacity-30">${state.live ? "타겟을 작성하고 있습니다" : "인터뷰 대상 선택"}</button>
+                  <button onclick="setState({step: 3})" class="w-full py-5 bg-blue-600 text-white rounded-2xl font-black text-lg shadow-lg btn-active">인터뷰 대상 선택</button>
                 </div>
               </div>`;
             break;
@@ -1042,10 +960,9 @@
             const curPersona = [...state.aiPersonas, ...state.manualPersonas].find(p => p.id === curH.personaId) || curH.persona || { name: "인터뷰 대상", description: "", needs: "" };
             content += `<div class="pt-[100px] px-5 dock-space-2 animate-fade-in bg-white">
                 ${renderHeader("인터뷰 결과", 3)}
-                ${curH.pending ? liveBar(curH.result.qaPairs.every(x => x.a) ? "요약·인사이트 정리 중 · 답변" : "인터뷰 답변 작성 중", curH.result.qaPairs.filter(x => x.a).length, curH.result.qaPairs.length) : ""}
                 <div class="mb-5 p-6 bg-dark-navy rounded-[2rem] text-white shadow-xl">
                     <h2 class="text-2xl font-black mb-3 leading-tight">${curPersona.name}님 리포트</h2>
-                    <p class="text-slate-300 text-lg leading-relaxed whitespace-pre-line font-medium">${curH.result.summary || (curH.pending ? '<span class="text-slate-400">모든 답변이 나오면 인터뷰 요약을 정리합니다.</span>' : "")}</p>
+                    <p class="text-slate-300 text-lg leading-relaxed whitespace-pre-line font-medium">${curH.result.summary}</p>
                 </div>
                 <div class="space-y-3 mb-5">
                   ${curH.result.qaPairs.map((qa, i) => `
@@ -1053,7 +970,7 @@
                       <div class="text-blue-600 font-black text-[11px] uppercase mb-2 tracking-widest flex items-center gap-2">Question</div>
                       <div class="text-slate-900 font-bold text-lg mb-4 leading-relaxed">${i+1}. ${qa.q}</div>
                       <div class="text-slate-400 font-black text-[11px] uppercase mb-2 tracking-widest flex items-center gap-2">Answer</div>
-                      <div class="text-slate-700 font-medium text-lg leading-relaxed">${qa.a || `<span class="flex items-center gap-2 text-slate-400 text-base"><span class="w-4 h-4 border-2 border-slate-200 border-t-blue-600 rounded-full animate-spin"></span> 답변 작성 중</span>`}</div>
+                      <div class="text-slate-700 font-medium text-lg leading-relaxed">${qa.a}</div>
                     </div>`).join('')}
                 </div>
                 <div class="p-4 bg-blue-50/50 border border-blue-100 rounded-3xl space-y-2.5 mb-5">
@@ -1061,7 +978,7 @@
                       <i data-lucide="sparkles" class="w-4 h-4"></i> 인터뷰 추가 질문
                     </h4>
                     <div class="flex items-center gap-2">
-                      <input type="text" id="followup-input" ${curH.pending ? "disabled" : ""} onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.askFollowUp();}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 3번 대답의 000에 대해 자세한 설명">
+                      <input type="text" id="followup-input" onkeydown="if(event.key==='Enter' && !event.isComposing){event.preventDefault(); Actions.askFollowUp();}" class="flex-1 min-w-0 h-12 px-4 bg-white border border-blue-100 rounded-2xl text-base outline-none focus:ring-2 focus:ring-blue-500 font-medium" placeholder="예: 3번 대답의 000에 대해 자세한 설명">
                       <button onclick="Actions.askFollowUp()" aria-label="보내기" class="shrink-0 w-12 h-12 bg-blue-600 text-white rounded-2xl shadow-md flex items-center justify-center btn-active">
                         <i data-lucide="send" class="w-5 h-5"></i>
                       </button>
@@ -1069,7 +986,7 @@
                   </div>
                 <div class="p-6 bg-blue-50 border border-blue-100 rounded-[2rem] shadow-inner">
                   <h3 class="text-blue-600 font-black text-sm uppercase tracking-widest mb-3 flex items-center gap-2"><i data-lucide="lightbulb" class="w-5 h-5"></i> Key Insights</h3>
-                  <div class="text-slate-800 font-bold text-lg leading-relaxed whitespace-pre-line">${curH.result.keyInsights || (curH.pending ? '<span class="text-slate-400 font-medium text-base">인터뷰가 끝나면 핵심 인사이트를 정리합니다.</span>' : "")}</div>
+                  <div class="text-slate-800 font-bold text-lg leading-relaxed whitespace-pre-line">${curH.result.keyInsights}</div>
                 </div>
                 <div class="fixed bottom-0 left-0 right-0 px-5 pt-3 dock bg-white/95 backdrop-blur-md border-t border-slate-100 max-w-[430px] mx-auto z-[60] space-y-2">
                   <button onclick="setState({step: 3})" class="w-full py-4 bg-white border-2 border-blue-600 text-blue-600 rounded-2xl font-black text-lg flex items-center justify-center gap-2 btn-active">
